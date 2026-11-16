@@ -11,19 +11,22 @@ Desk booking app: React UI (Vite) + plain Node HTTP API on built-in `node:sqlite
 - `server/mock-oidc.ts` — dev-only local OIDC provider for trying Microsoft sign-in without Entra
 - `server/dev-env.ts` — loads `.env` for `npm run dev` (not `--env-file`: with `--watch-path` it restart-loops the server)
 - `client/App.tsx` — the whole UI; `client/styles.css` — styles
+- `.github/workflows/` — CI (lint, build, test, audit), CodeQL, deploy (staging, then prod after approval)
 
 ## Commands
 
 - `npm run dev` — run the app at http://localhost:3000
 - `npm test` — API tests (`node:test`)
 - `npm run build` — typecheck (`tsc`) + production build
+- `npm run lint` — Biome linter (formatter is off)
 
 ## Definition of done
 
 1. `npm test` passes.
 2. `npm run build` passes (this is the typecheck).
-3. Every API behavior change has a test in `server/app.test.ts`.
-4. Every new or changed route has negative tests: 401 with no session, 403 for a non-admin on admin routes, 403 when acting on another user's data. Happy-path tests alone do not count.
+3. `npm run lint` reports no errors.
+4. Every API behavior change has a test in `server/app.test.ts`.
+5. Every new or changed route has negative tests: 401 with no session, 403 for a non-admin on admin routes, 403 when acting on another user's data. Happy-path tests alone do not count.
 
 ## Security requirements
 
@@ -66,7 +69,7 @@ These are mandatory. A change that breaks one is not done, even if tests pass. I
 | Zone | Paths |
 |---|---|
 | Edit freely | `client/**`, `server/**`, `README.md`, `AGENTS.md` |
-| Ask first | `package.json`, `package-lock.json`, `tsconfig.json`, `vite.config.ts`, `index.html`, `.gitignore` |
+| Ask first | `package.json`, `package-lock.json`, `tsconfig.json`, `vite.config.ts`, `biome.json`, `index.html`, `.gitignore`, `.github/**` |
 | Never touch | `*.db` (real data), `dist/**`, `node_modules/**`, `.env*` |
 
 ## Git

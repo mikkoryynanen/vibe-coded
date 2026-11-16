@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "node --watch-path=server --import ./server/dev-env.ts server/index.ts",
     "build": "tsc && vite build",
-    "test": "node --test server/app.test.ts"
+    "test": "node --test server/app.test.ts",
+    "lint": "biome lint"
   },
   "dependencies": {
     "openid-client": "^6.9.0",
@@ -13,6 +14,7 @@
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.8",
     "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
