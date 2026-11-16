@@ -70,6 +70,7 @@ One-time setup in the Entra admin center (done by a person):
 How it behaves:
 
 - Users are matched by their Entra object id (`oid`). The display name comes from the `name` claim; if another user already has that name, a short id suffix is added.
+- Clicking **Sign in with Microsoft** always shows the Microsoft account picker, so you can choose another account.
 - Admin rights come from the `Admin` app role and are re-read on every sign-in.
 - A Microsoft sign-in session lasts 15 minutes on the server, then the app signs in again silently (no prompt while the Microsoft session lives) and re-reads the role.
 - **Known security gap:** removing the `Admin` role or disabling a user takes effect only at that next re-check, so up to 15 minutes later.

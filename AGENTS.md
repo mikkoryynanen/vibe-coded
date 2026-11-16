@@ -9,6 +9,7 @@ Desk booking app: React UI (Vite) + plain Node HTTP API on built-in `node:sqlite
 - `server/index.ts` — entry point; serves API + Vite dev middleware on one port
 - `server/app.test.ts` — API tests (Microsoft sign-in runs against `oauth2-mock-server`)
 - `server/mock-oidc.ts` — dev-only local OIDC provider for trying Microsoft sign-in without Entra
+- `server/dev-env.ts` — loads `.env` for `npm run dev` (not `--env-file`: with `--watch-path` it restart-loops the server)
 - `client/App.tsx` — the whole UI; `client/styles.css` — styles
 
 ## Commands

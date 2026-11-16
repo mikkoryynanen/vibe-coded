@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --env-file-if-exists=.env --watch-path=server server/index.ts",
+    "dev": "node --watch-path=server --import ./server/dev-env.ts server/index.ts",
     "build": "tsc && vite build",
     "test": "node --test server/app.test.ts"
   },

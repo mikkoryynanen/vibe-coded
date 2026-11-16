@@ -149,7 +149,8 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
           code_challenge_method: 'S256',
           state,
           nonce,
-          ...(silent && { prompt: 'none' }),
+          // Interactive: let the user pick the account even when the browser already has a Microsoft session.
+          prompt: silent ? 'none' : 'select_account',
         });
         res.setHeader('Set-Cookie', oidcCookie([verifier, state, nonce, silent ? 1 : 0].join('.'), 600));
         return redirect(res, target.href);

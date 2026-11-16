@@ -178,7 +178,7 @@ test('oidc login redirect and flow cookie', async (t) => {
     assert.equal(to.searchParams.get(k), v, k);
   for (const k of ['state', 'nonce', 'code_challenge']) assert.ok(to.searchParams.get(k), k);
   assert.match(to.searchParams.get('redirect_uri')!, /^http:\/\/localhost:\d+\/api\/callback$/);
-  assert.equal(to.searchParams.get('prompt'), null, 'interactive login sends no prompt');
+  assert.equal(to.searchParams.get('prompt'), 'select_account', 'interactive login lets the user choose the account');
   assert.equal(to.searchParams.get('response_mode'), null, 'default query response mode');
   const flow = setCookie(login, 'oidc') ?? '';
   for (const part of ['HttpOnly', 'SameSite=Lax', 'Secure', 'Path=/api/callback', 'Max-Age=600'])
@@ -189,7 +189,7 @@ test('oidc login redirect and flow cookie', async (t) => {
   assert.equal(silent.authorizeUrl.searchParams.get('prompt'), 'none');
   assert.equal(silent.location, '/', 'a successful silent sign-in lands signed in');
   const other = await fetch(`${base}/login?silent=yes`, { redirect: 'manual' });
-  assert.equal(new URL(other.headers.get('location')!).searchParams.get('prompt'), null, 'only silent=1 counts');
+  assert.equal(new URL(other.headers.get('location')!).searchParams.get('prompt'), 'select_account', 'only silent=1 counts');
 });
 
 test('oidc sign-in creates, reuses and updates the user', async (t) => {
