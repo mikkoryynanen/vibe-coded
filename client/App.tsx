@@ -45,7 +45,7 @@ export function App() {
       <header>
         <h1>Desk Booking</h1>
         <span>
-          {user.name} {user.admin && <span className="badge">admin</span>} <button onClick={logout}>Log out</button>
+          {user.name} {user.admin && <span className="badge">admin</span>} <button type="button" onClick={logout}>Log out</button>
         </span>
       </header>
       <Booker user={user} />
@@ -112,13 +112,13 @@ function Booker({ user }: { user: User }) {
   return (
     <>
       {user.admin && (
-        <nav className="tabs" role="tablist">
+        <div className="tabs" role="tablist">
           {tabs.map(([id, label]) => (
-            <button key={id} role="tab" aria-selected={tab === id} onClick={() => { setTab(id); setError(''); }}>
+            <button type="button" key={id} role="tab" aria-selected={tab === id} onClick={() => { setTab(id); setError(''); }}>
               {label}
             </button>
           ))}
-        </nav>
+        </div>
       )}
       {error && <p className="error" role="alert">{error}</p>}
       {tab === 'rooms' && <RoomAdmin rooms={rooms} act={act} />}
@@ -132,7 +132,7 @@ function Booker({ user }: { user: User }) {
         </label>
         <label>From<input type="time" value={start} onChange={(e) => setStart(e.target.value)} required /></label>
         <label>To<input type="time" value={end} onChange={(e) => setEnd(e.target.value)} required /></label>
-        <button disabled={!rooms.length}>Book</button>
+        <button type="submit" disabled={!rooms.length}>Book</button>
       </form>
       {!rooms.length && <p className="muted">No rooms yet.{user.admin && ' Add one in Manage rooms.'}</p>}
 
@@ -148,7 +148,7 @@ function Booker({ user }: { user: User }) {
                 <li key={b.id}>
                   <span className="time">{hhmm(b.start)}–{hhmm(b.end)}</span> {b.userName}
                   {(b.userId === user.id || user.admin) && (
-                    <button className="danger" onClick={act(() => api('DELETE', `/bookings/${b.id}`))}>Cancel</button>
+                    <button type="button" className="danger" onClick={act(() => api('DELETE', `/bookings/${b.id}`))}>Cancel</button>
                   )}
                 </li>
               ))}
@@ -178,14 +178,14 @@ function RoomAdmin({ rooms, act }: { rooms: Room[]; act: (fn: () => Promise<unkn
       <h2>Manage rooms</h2>
       <form onSubmit={(e) => { e.preventDefault(); act(() => api('POST', '/rooms', { name }).then(() => setName('')))(); }}>
         <label>New room or desk<input value={name} onChange={(e) => setName(e.target.value)} required maxLength={50} /></label>
-        <button>Add</button>
+        <button type="submit">Add</button>
       </form>
       <ul>
         {rooms.map((r) => (
           <li key={r.id}>
             {r.name}
-            <button onClick={() => rename(r)}>Rename</button>
-            <button className="danger" onClick={() => remove(r)}>Delete</button>
+            <button type="button" onClick={() => rename(r)}>Rename</button>
+            <button type="button" className="danger" onClick={() => remove(r)}>Delete</button>
           </li>
         ))}
       </ul>
