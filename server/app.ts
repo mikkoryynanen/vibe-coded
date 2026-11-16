@@ -186,22 +186,23 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
 
     const token = cookie(req, 'session');
     const user = q.userByToken.get(token) as (User & { expiresAt: number | null }) | undefined;
-    if (user && user.expiresAt !== null && user.expiresAt <= Date.now()) {
+    if (!user) throw new HttpError(401, 'Not logged in');
+    // Before the expiry check: logging out of an expired session must not answer reauth, or the client signs straight back in.
+    if (method === 'POST' && path === '/api/logout') {
+      q.delSession.run(token);
+      res.setHeader('Set-Cookie', sessionCookie('', 0));
+      return {};
+    }
+    if (user.expiresAt !== null && user.expiresAt <= Date.now()) {
       // Deleting the row first means a failed silent re-sign-in ends in a plain 401, so the client cannot loop.
       q.delSession.run(token);
       res.setHeader('Set-Cookie', sessionCookie('', 0));
       res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Session expired', reauth: true }));
       return;
     }
-    if (!user) throw new HttpError(401, 'Not logged in');
     const requireAdmin = () => { if (!user.admin) throw new HttpError(403, 'Admins only'); };
 
     if (method === 'GET' && path === '/api/me') return { id: user.id, name: user.name, admin: !!user.admin };
-    if (method === 'POST' && path === '/api/logout') {
-      q.delSession.run(token);
-      res.setHeader('Set-Cookie', sessionCookie('', 0));
-      return {};
-    }
 
     if (method === 'POST' && path === '/api/users') {
       requireAdmin();

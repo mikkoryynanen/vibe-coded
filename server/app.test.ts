@@ -250,6 +250,16 @@ test('oidc sessions expire and ask for a silent re-sign-in', async (t) => {
   assert.equal(again.status, 401);
   assert.deepEqual(again.data, { error: 'Not logged in' }, 'no reauth the second time, so no loop');
 
+  const leaving = (await signIn({ oid: 'oid-exp', name: 'Expiring' })).token;
+  db.prepare('UPDATE sessions SET expires_at = ? WHERE token = ?').run(Date.now() - 1000, leaving);
+  const out = await call('POST', '/logout', leaving);
+  assert.equal(out.status, 200, 'logout of an expired session succeeds instead of asking for reauth');
+  assert.deepEqual(out.data, {});
+  assert.ok(setCookie(out.res, 'session')?.includes('Max-Age=0'), 'session cookie cleared');
+  assert.equal(db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(leaving), undefined, 'row deleted');
+  assert.equal((await call('POST', '/logout')).status, 401, 'logout without a session cookie stays 401');
+  assert.equal((await call('POST', '/logout', leaving)).status, 401);
+
   const pw = await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' });
   const pwToken = cookieValue(pw.res, 'session');
   assert.equal(db.prepare('SELECT expires_at AS e FROM sessions WHERE token = ?').get(pwToken)?.e, null, 'password sessions keep no expiry');
