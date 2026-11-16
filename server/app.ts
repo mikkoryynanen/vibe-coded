@@ -82,6 +82,8 @@ export function createHandler(db: DatabaseSync) {
     const body = method === 'POST' || method === 'PATCH' ? await readJson(req) : {};
 
     if (method === 'POST' && path === '/api/login') {
+      // Cross-site forms cannot send application/json, so this blocks login CSRF.
+      if (!/^application\/json\s*(;|$)/i.test(req.headers['content-type'] ?? '')) throw new HttpError(415, 'Expected application/json');
       const row = q.userByName.get(String(body.name ?? '')) as (User & { pass: string }) | undefined;
       if (!row || !checkPassword(String(body.password ?? ''), row.pass)) throw new HttpError(401, 'Wrong name or password');
       const { token, user } = startSession(row);

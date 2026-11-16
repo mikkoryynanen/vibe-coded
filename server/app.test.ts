@@ -10,18 +10,18 @@ function startServer(t: TestContext) {
   seedAdmin(db, 'admin-pass');
   const server = createServer(createHandler(db)).listen(0);
   t.after(() => server.close());
-  return `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
+  return { db, base: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api` };
 }
 
 const sessionToken = (res: Response) => res.headers.get('set-cookie')?.match(/^session=([^;]*)/)?.[1] ?? '';
 
 test('booking flow', async (t) => {
-  const base = startServer(t);
+  const { base } = startServer(t);
 
   const call = async (method: string, path: string, token?: string, body?: object) => {
     const res = await fetch(base + path, {
       method,
-      headers: token ? { Cookie: `session=${token}` } : {},
+      headers: { 'Content-Type': 'application/json', ...(token && { Cookie: `session=${token}` }) },
       body: body && JSON.stringify(body),
     });
     return { status: res.status, data: await res.json(), token: sessionToken(res) };
@@ -69,10 +69,21 @@ test('booking flow', async (t) => {
 });
 
 test('session cookie', async (t) => {
-  const base = startServer(t);
+  const { base, db } = startServer(t);
   const post = (path: string, headers: Record<string, string>, body?: object) =>
-    fetch(base + path, { method: 'POST', headers, body: body && JSON.stringify(body) });
+    fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: body && JSON.stringify(body) });
   const me = (headers: Record<string, string>) => fetch(base + '/me', { headers });
+
+  const creds = JSON.stringify({ name: 'admin', password: 'admin-pass' });
+  for (const type of [undefined, 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', 'application/jsonx']) {
+    const r = await fetch(base + '/login', { method: 'POST', headers: type ? { 'Content-Type': type } : {}, body: new Blob([creds]) });
+    assert.ok(r.status >= 400 && r.status < 500, `${type}: ${r.status}`);
+    assert.equal(r.headers.get('set-cookie'), null, `${type} sets no cookie`);
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get()?.n, 0, 'no session rows from rejected logins');
+  const charset = await post('/login', { 'Content-Type': 'application/json; charset=utf-8' }, { name: 'admin', password: 'admin-pass' });
+  assert.equal(charset.status, 200);
+  assert.ok(sessionToken(charset));
 
   const bad = await post('/login', {}, { name: 'admin', password: 'nope' });
   assert.equal(bad.status, 401);
