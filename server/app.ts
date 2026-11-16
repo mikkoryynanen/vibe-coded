@@ -75,22 +75,31 @@ export function createHandler(db: DatabaseSync) {
     return { token, user: { id: user.id, name: user.name, admin: !!user.admin } };
   }
 
-  async function route(req: IncomingMessage, method: string, path: string, url: URL): Promise<unknown> {
+  // Secure always: localhost counts as a secure context, and deployed HTTPS ends at a proxy in front of plain-HTTP Node.
+  const sessionCookie = (value: string, maxAge: number) => `session=${value}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${maxAge}`;
+
+  async function route(req: IncomingMessage, res: ServerResponse, method: string, path: string, url: URL): Promise<unknown> {
     const body = method === 'POST' || method === 'PATCH' ? await readJson(req) : {};
 
     if (method === 'POST' && path === '/api/login') {
       const row = q.userByName.get(String(body.name ?? '')) as (User & { pass: string }) | undefined;
       if (!row || !checkPassword(String(body.password ?? ''), row.pass)) throw new HttpError(401, 'Wrong name or password');
-      return startSession(row);
+      const { token, user } = startSession(row);
+      res.setHeader('Set-Cookie', sessionCookie(token, 60 * 60 * 24 * 30));
+      return { user };
     }
 
-    const token = req.headers.authorization?.replace(/^Bearer /, '') ?? '';
+    const token = req.headers.cookie?.match(/(?:^|;\s*)session=([^;]*)/)?.[1] ?? '';
     const user = q.userByToken.get(token) as User | undefined;
     if (!user) throw new HttpError(401, 'Not logged in');
     const requireAdmin = () => { if (!user.admin) throw new HttpError(403, 'Admins only'); };
 
     if (method === 'GET' && path === '/api/me') return { id: user.id, name: user.name, admin: !!user.admin };
-    if (method === 'POST' && path === '/api/logout') return q.delSession.run(token), {};
+    if (method === 'POST' && path === '/api/logout') {
+      q.delSession.run(token);
+      res.setHeader('Set-Cookie', sessionCookie('', 0));
+      return {};
+    }
 
     if (method === 'POST' && path === '/api/users') {
       requireAdmin();
@@ -151,7 +160,7 @@ export function createHandler(db: DatabaseSync) {
     let result: unknown;
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
-      result = await route(req, req.method ?? 'GET', url.pathname, url);
+      result = await route(req, res, req.method ?? 'GET', url.pathname, url);
     } catch (e) {
       if (e instanceof HttpError) [status, result] = [e.status, { error: e.message }];
       else if (e instanceof Error && e.message.includes('UNIQUE')) [status, result] = [409, { error: 'That name is already taken' }];

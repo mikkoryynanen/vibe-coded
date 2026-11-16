@@ -4,12 +4,10 @@ type User = { id: number; name: string; admin: boolean };
 type Room = { id: number; name: string };
 type Booking = { id: number; roomId: number; userId: number; userName: string; start: string; end: string };
 
-let token = localStorage.getItem('token') ?? '';
-
 async function api<T = unknown>(method: string, path: string, body?: object): Promise<T> {
   const res = await fetch(`/api${path}`, {
     method,
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: body && JSON.stringify(body),
   });
   const data = await res.json();
@@ -22,17 +20,14 @@ const hhmm = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-di
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(!!token);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!token) return;
-    api<User>('GET', '/me').then(setUser, () => (token = '')).finally(() => setLoading(false));
+    api<User>('GET', '/me').then(setUser, () => {}).finally(() => setLoading(false));
   }, []);
 
   const logout = async () => {
     await api('POST', '/logout').catch(() => {});
-    localStorage.removeItem('token');
-    token = '';
     setUser(null);
   };
 
@@ -58,10 +53,7 @@ function Login({ onLogin }: { onLogin: (u: User) => void }) {
 
   const submit = async () => {
     try {
-      const res = await api<{ token: string; user: User }>('POST', '/login', { name, password });
-      token = res.token;
-      localStorage.setItem('token', token);
-      onLogin(res.user);
+      onLogin((await api<{ user: User }>('POST', '/login', { name, password })).user);
     } catch (e) {
       setError((e as Error).message);
     }
