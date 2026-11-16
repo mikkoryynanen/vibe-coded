@@ -1,37 +1,43 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { openDb, seedAdmin } from './db.ts';
 import { createHandler } from './app.ts';
 
-test('booking flow', async (t) => {
+function startServer(t: TestContext) {
   const db = openDb(':memory:');
   seedAdmin(db, 'admin-pass');
   const server = createServer(createHandler(db)).listen(0);
   t.after(() => server.close());
-  const base = `http://localhost:${(server.address() as AddressInfo).port}/api`;
+  return { db, base: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api` };
+}
+
+const sessionToken = (res: Response) => res.headers.get('set-cookie')?.match(/^session=([^;]*)/)?.[1] ?? '';
+
+test('booking flow', async (t) => {
+  const { base } = startServer(t);
 
   const call = async (method: string, path: string, token?: string, body?: object) => {
     const res = await fetch(base + path, {
       method,
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      headers: { 'Content-Type': 'application/json', ...(token && { Cookie: `session=${token}` }) },
       body: body && JSON.stringify(body),
     });
-    return { status: res.status, data: await res.json() };
+    return { status: res.status, data: await res.json(), token: sessionToken(res) };
   };
 
   assert.equal((await call('GET', '/rooms')).status, 401);
   assert.equal((await call('POST', '/login', undefined, { name: 'admin', password: 'nope' })).status, 401);
 
-  const admin = (await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' })).data.token;
+  const admin = (await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' })).token;
   assert.equal((await call('POST', '/register', undefined, { name: 'eve', password: 'password' })).status, 401, 'no self-registration');
   assert.equal((await call('POST', '/users', undefined, { name: 'eve', password: 'password' })).status, 401);
   assert.equal((await call('POST', '/users', admin, { name: 'alice', password: 'pass' })).status, 200);
   assert.equal((await call('POST', '/users', admin, { name: 'bob', password: 'password2' })).status, 200);
   assert.equal((await call('POST', '/users', admin, { name: 'Alice', password: 'password3' })).status, 409);
   assert.equal((await call('POST', '/users', admin, { name: 'carol', password: 'abc' })).status, 400);
-  const login = async (name: string, password: string) => (await call('POST', '/login', undefined, { name, password })).data.token;
+  const login = async (name: string, password: string) => (await call('POST', '/login', undefined, { name, password })).token;
   const alice = await login('alice', 'pass');
   const bob = await login('bob', 'password2');
   assert.equal((await call('POST', '/users', alice, { name: 'mallory', password: 'password' })).status, 403);
@@ -60,4 +66,57 @@ test('booking flow', async (t) => {
   assert.equal((await call('DELETE', `/rooms/${roomId}`, admin)).status, 200);
   const after = await call('GET', '/bookings?from=2030-01-01T00:00Z&to=2030-01-02T00:00Z', bob);
   assert.equal(after.data.length, 0, 'deleting a room removes its bookings');
+});
+
+test('session cookie', async (t) => {
+  const { base, db } = startServer(t);
+  const post = (path: string, headers: Record<string, string>, body?: object) =>
+    fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: body && JSON.stringify(body) });
+  const me = (headers: Record<string, string>) => fetch(base + '/me', { headers });
+
+  const creds = JSON.stringify({ name: 'admin', password: 'admin-pass' });
+  for (const type of [undefined, 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', 'application/jsonx']) {
+    const r = await fetch(base + '/login', { method: 'POST', headers: type ? { 'Content-Type': type } : {}, body: new Blob([creds]) });
+    assert.ok(r.status >= 400 && r.status < 500, `${type}: ${r.status}`);
+    assert.equal(r.headers.get('set-cookie'), null, `${type} sets no cookie`);
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get()?.n, 0, 'no session rows from rejected logins');
+  const charset = await post('/login', { 'Content-Type': 'application/json; charset=utf-8' }, { name: 'admin', password: 'admin-pass' });
+  assert.equal(charset.status, 200);
+  assert.ok(sessionToken(charset));
+
+  const bad = await post('/login', {}, { name: 'admin', password: 'nope' });
+  assert.equal(bad.status, 401);
+  assert.equal(bad.headers.get('set-cookie'), null);
+
+  const login = await post('/login', {}, { name: 'admin', password: 'admin-pass' });
+  assert.equal(login.status, 200);
+  const body = await login.json();
+  assert.equal(body.user.name, 'admin');
+  assert.equal('token' in body, false, 'token stays out of the body');
+  const cookie = login.headers.get('set-cookie') ?? '';
+  for (const part of ['HttpOnly', 'SameSite=Lax', 'Path=/', 'Max-Age=2592000', 'Secure'])
+    assert.ok(cookie.split('; ').includes(part), `login cookie has ${part}: ${cookie}`);
+  const token = sessionToken(login);
+  assert.ok(token);
+
+  const ok = await me({ Cookie: `other=1; session=${token}` });
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).name, 'admin');
+  for (const headers of [{}, { Cookie: 'session=bogus' }, { Cookie: 'session=' }, { Authorization: `Bearer ${token}` }] as Record<string, string>[]) {
+    const r = await me(headers);
+    assert.equal(r.status, 401, JSON.stringify(headers));
+    assert.equal((await r.json()).error, 'Not logged in');
+  }
+
+  const out = await post('/logout', { Cookie: `session=${token}` });
+  assert.equal(out.status, 200);
+  const cleared = out.headers.get('set-cookie') ?? '';
+  assert.ok(cleared.startsWith('session=;'), cleared);
+  assert.ok(cleared.includes('Max-Age=0') && cleared.includes('Secure'), cleared);
+  assert.equal((await me({ Cookie: `session=${token}` })).status, 401);
+
+  const again = await post('/logout', { Cookie: `session=${token}` });
+  assert.equal(again.status, 401, 'logout without a valid session stays 401');
+  assert.equal(again.headers.get('set-cookie'), null);
 });
