@@ -3,11 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch-path=server server/index.ts",
+    "dev": "node --env-file-if-exists=.env --watch-path=server server/index.ts",
     "build": "tsc && vite build",
     "test": "node --test server/app.test.ts"
   },
   "dependencies": {
+    "openid-client": "^6.9.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
@@ -16,6 +17,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
+    "oauth2-mock-server": "^9.3.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.8"
   }

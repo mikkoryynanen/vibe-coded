@@ -1,9 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
+import * as client from 'openid-client';
 import { checkPassword, hashPassword } from './db.ts';
 
 type User = { id: number; name: string; admin: number };
+export type OidcConfig = { issuer: string; clientId: string; clientSecret: string; redirectUri: string };
 type Body = Record<string, unknown>;
 
 class HttpError extends Error {
@@ -46,12 +48,29 @@ function time(v: unknown, field: string) {
   return d.toISOString();
 }
 
-export function createHandler(db: DatabaseSync) {
+const cookie = (req: IncomingMessage, name: 'session' | 'oidc') =>
+  req.headers.cookie?.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`))?.[1] ?? '';
+
+const redirect = (res: ServerResponse, location: string) => { res.writeHead(302, { Location: location }).end(); };
+
+// Server log only: openid-client keeps the specific reason (bad state, signature, aud...) in `cause`.
+const logOidcFailure = (step: string, e: unknown) => {
+  const cause = e instanceof Error ? e.cause : undefined;
+  console.error(`OIDC ${step} failed:`, e instanceof Error ? e.message : e, cause instanceof Error ? `(${cause.message})` : '');
+};
+
+// OIDC sessions end after this, so the next silent sign-in re-reads the Entra roles.
+const OIDC_SESSION_MS = 15 * 60 * 1000;
+
+export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
   const q = {
     userByName: db.prepare('SELECT id, name, admin, pass FROM users WHERE name = ?'),
-    userByToken: db.prepare('SELECT u.id, u.name, u.admin FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
+    userByOid: db.prepare('SELECT id FROM users WHERE oid = ?'),
+    userByToken: db.prepare('SELECT u.id, u.name, u.admin, s.expires_at AS expiresAt FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
     addUser: db.prepare('INSERT INTO users (name, pass) VALUES (?, ?)'),
-    addSession: db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)'),
+    addOidcUser: db.prepare("INSERT INTO users (name, pass, admin, oid) VALUES (?, '', ?, ?)"),
+    updateOidcUser: db.prepare('UPDATE users SET name = ?, admin = ? WHERE id = ?'),
+    addSession: db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)'),
     delSession: db.prepare('DELETE FROM sessions WHERE token = ?'),
     rooms: db.prepare('SELECT id, name FROM rooms ORDER BY name'),
     room: db.prepare('SELECT id FROM rooms WHERE id = ?'),
@@ -68,18 +87,92 @@ export function createHandler(db: DatabaseSync) {
     delBooking: db.prepare('DELETE FROM bookings WHERE id = ?'),
   };
 
-  // shortcut: sessions never expire, add an expires_at column if tokens must time out.
-  function startSession(user: { id: number; name: string; admin: number }) {
+  // expiresAt null: password sessions keep no server expiry until password login is removed (job 003).
+  function startSession(user: { id: number; name: string; admin: number }, expiresAt: number | null = null) {
     const token = randomBytes(32).toString('base64url');
-    q.addSession.run(token, user.id);
+    q.addSession.run(token, user.id, expiresAt);
     return { token, user: { id: user.id, name: user.name, admin: !!user.admin } };
   }
 
   // Secure always: localhost counts as a secure context, and deployed HTTPS ends at a proxy in front of plain-HTTP Node.
   const sessionCookie = (value: string, maxAge: number) => `session=${value}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${maxAge}`;
+  const oidcCookie = (value: string, maxAge: number) => `oidc=${value}; Path=/api/callback; HttpOnly; SameSite=Lax; Secure; Max-Age=${maxAge}`;
+
+  let discovered: Promise<client.Configuration> | undefined;
+  const oidcClient = () => {
+    if (!oidc) throw new Error('OIDC is not configured (OIDC_* env vars missing)');
+    const { hostname, protocol } = new URL(oidc.issuer);
+    // Plain http only for a local mock provider; Entra is always https.
+    const insecure = protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1');
+    discovered ??= client.discovery(new URL(oidc.issuer), oidc.clientId, oidc.clientSecret, undefined, {
+      execute: [...(insecure ? [client.allowInsecureRequests] : []), client.enableNonRepudiationChecks],
+    }).catch((e) => { discovered = undefined; throw e; });
+    return discovered;
+  };
+
+  async function signIn(url: URL, flow: string) {
+    const [verifier, state, nonce] = flow.split('.');
+    if (!verifier || !state || !nonce) throw new Error('OIDC flow cookie missing or expired');
+    const config = await oidcClient();
+    const currentUrl = new URL(url.pathname + url.search, oidc!.redirectUri);
+    const tokens = await client.authorizationCodeGrant(config, currentUrl, { pkceCodeVerifier: verifier, expectedState: state, expectedNonce: nonce, idTokenExpected: true });
+    const claims = tokens.claims()!;
+    if (typeof claims.oid !== 'string' || !claims.oid) throw new Error('ID token has no oid claim');
+    const oid = claims.oid;
+    const claimed = typeof claims.name === 'string' && claims.name.trim() ? claims.name : claims.preferred_username;
+    let name = typeof claimed === 'string' ? claimed.trim().slice(0, 50) : '';
+    if (!name) throw new Error('ID token has no name or preferred_username claim');
+    const admin = Array.isArray(claims.roles) && claims.roles.includes('Admin') ? 1 : 0;
+    const existing = q.userByOid.get(oid) as { id: number } | undefined;
+    const taken = q.userByName.get(name) as { id: number } | undefined;
+    if (taken && taken.id !== existing?.id) name = `${name} (${oid.slice(0, 8)})`;
+    let id = existing?.id;
+    if (id) q.updateOidcUser.run(name, admin, id);
+    else id = Number(q.addOidcUser.run(name, admin, oid).lastInsertRowid);
+    return startSession({ id, name, admin }, Date.now() + OIDC_SESSION_MS);
+  }
 
   async function route(req: IncomingMessage, res: ServerResponse, method: string, path: string, url: URL): Promise<unknown> {
     const body = method === 'POST' || method === 'PATCH' ? await readJson(req) : {};
+
+    if (method === 'GET' && path === '/api/login') {
+      try {
+        const config = await oidcClient();
+        const verifier = client.randomPKCECodeVerifier();
+        const state = client.randomState();
+        const nonce = client.randomNonce();
+        const silent = url.searchParams.get('silent') === '1';
+        const target = client.buildAuthorizationUrl(config, {
+          redirect_uri: oidc!.redirectUri,
+          scope: 'openid profile email',
+          code_challenge: await client.calculatePKCECodeChallenge(verifier),
+          code_challenge_method: 'S256',
+          state,
+          nonce,
+          ...(silent && { prompt: 'none' }),
+        });
+        res.setHeader('Set-Cookie', oidcCookie([verifier, state, nonce, silent ? 1 : 0].join('.'), 600));
+        return redirect(res, target.href);
+      } catch (e) {
+        logOidcFailure('login', e);
+        return redirect(res, '/?login_error=1');
+      }
+    }
+
+    if (method === 'GET' && path === '/api/callback') {
+      const flow = cookie(req, 'oidc');
+      try {
+        const { token } = await signIn(url, flow);
+        res.setHeader('Set-Cookie', [oidcCookie('', 0), sessionCookie(token, 60 * 60 * 24 * 30)]);
+        return redirect(res, '/');
+      } catch (e) {
+        logOidcFailure('callback', e);
+        res.setHeader('Set-Cookie', oidcCookie('', 0));
+        // A failed silent re-check (login_required etc.) shows the plain login screen, not an error.
+        const silent = flow.split('.')[3] === '1';
+        return redirect(res, silent && url.searchParams.has('error') ? '/' : '/?login_error=1');
+      }
+    }
 
     if (method === 'POST' && path === '/api/login') {
       // Cross-site forms cannot send application/json, so this blocks login CSRF.
@@ -91,8 +184,15 @@ export function createHandler(db: DatabaseSync) {
       return { user };
     }
 
-    const token = req.headers.cookie?.match(/(?:^|;\s*)session=([^;]*)/)?.[1] ?? '';
-    const user = q.userByToken.get(token) as User | undefined;
+    const token = cookie(req, 'session');
+    const user = q.userByToken.get(token) as (User & { expiresAt: number | null }) | undefined;
+    if (user && user.expiresAt !== null && user.expiresAt <= Date.now()) {
+      // Deleting the row first means a failed silent re-sign-in ends in a plain 401, so the client cannot loop.
+      q.delSession.run(token);
+      res.setHeader('Set-Cookie', sessionCookie('', 0));
+      res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Session expired', reauth: true }));
+      return;
+    }
     if (!user) throw new HttpError(401, 'Not logged in');
     const requireAdmin = () => { if (!user.admin) throw new HttpError(403, 'Admins only'); };
 
@@ -171,6 +271,7 @@ export function createHandler(db: DatabaseSync) {
         [status, result] = [500, { error: 'Server error' }];
       }
     }
-    res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));
+    // Redirects and the session-expired 401 are written inside route().
+    if (!res.writableEnded) res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));
   };
 }

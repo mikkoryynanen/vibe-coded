@@ -5,7 +5,9 @@ import { createHandler } from './app.ts';
 
 const db = openDb(process.env.DB_PATH ?? 'booking.db');
 seedAdmin(db);
-const api = createHandler(db);
+const { OIDC_ISSUER: issuer, OIDC_CLIENT_ID: clientId, OIDC_CLIENT_SECRET: clientSecret, OIDC_REDIRECT_URI: redirectUri } = process.env;
+// Until password login is removed (job 003), missing OIDC config only disables "Sign in with Microsoft".
+const api = createHandler(db, issuer && clientId && clientSecret && redirectUri ? { issuer, clientId, clientSecret, redirectUri } : undefined);
 const port = Number(process.env.PORT ?? 3000);
 
 // One server: /api goes to the API, everything else to Vite (UI with hot reload).
