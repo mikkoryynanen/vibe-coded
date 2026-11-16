@@ -21,13 +21,44 @@ Desk booking app: React UI (Vite) + plain Node HTTP API on built-in `node:sqlite
 1. `npm test` passes.
 2. `npm run build` passes (this is the typecheck).
 3. Every API behavior change has a test in `server/app.test.ts`.
+4. Every new or changed route has negative tests: 401 with no session, 403 for a non-admin on admin routes, 403 when acting on another user's data. Happy-path tests alone do not count.
+
+## Security requirements
+
+These are mandatory. A change that breaks one is not done, even if tests pass. If a task seems to need breaking one, stop and ask.
+
+**Access control**
+- Every route except `POST /api/login` requires a valid session. New routes go after the session check in `route()`, never before it.
+- Admin-only actions call `requireAdmin()` on the server. Hiding a button in the UI is not authorization.
+- Ownership is checked on the server: a user may only change or delete their own bookings (admins excepted). The user id comes from the session, never from the request body or URL.
+- Deny by default: unknown paths and methods return 404; a missing check is a bug, not a feature.
+
+**Input and data**
+- All SQL uses prepared statements with `?` parameters. Never build SQL with string concatenation or template literals containing request data.
+- Validate every request field at the API boundary (type, length, format) with the existing `text()` / `time()` helpers or equivalent. Request bodies stay capped (`readJson`, 100 KB).
+- Responses never include password hashes, session tokens of other users, or stack traces. Unexpected errors return a generic 500 and are logged server-side only.
+- The UI renders user-supplied text as text. No `dangerouslySetInnerHTML`, `innerHTML` or `eval`.
+
+**Secrets and credentials**
+- Passwords are stored only as salted `scrypt` hashes (`hashPassword`) and compared with `timingSafeEqual` (`checkPassword`). Never log or return them.
+- Session tokens come from `crypto.randomBytes` (at least 32 bytes). No `Math.random()` for anything security-related.
+- Secrets live in environment variables / `.env`, never in code, tests, logs, commits or `README.md`.
+
+**Dependencies**
+- No new dependency without asking (see Conventions). Run `npm audit` when adding or upgrading one and report high/critical findings.
+
+**Known gaps (accepted for now, do not make worse)**
+- Sessions never expire on the server; the `session` cookie expires after 30 days in the browser, and logout is the only server-side way to end one.
+- No rate limiting on `POST /api/login`.
+- No CSRF token: the session is an HttpOnly, `SameSite=Lax`, `Secure` cookie, so CSRF protection relies on SameSite plus every state change being non-GET, and `POST /api/login` accepting only `application/json` (415 otherwise). Keep GET routes free of side effects and keep that login check. Because the cookie is always `Secure`, plain-http access works only on `localhost`.
+- No security headers (CSP etc.) and no HTTPS in the app itself; deployment must put TLS in front.
+- `.env` is not yet in `.gitignore`.
 
 ## Conventions
 
 - Node 24 runs `.ts` directly (type stripping): no enums, namespaces or parameter properties (`erasableSyntaxOnly` enforces this).
 - Relative imports keep the `.ts`/`.tsx` extension; type-only imports use `import type` (`verbatimModuleSyntax`).
 - Prefer Node built-ins (`node:sqlite`, `node:crypto`, `node:test`). No new dependencies without asking.
-- Authorization lives in `server/app.ts`; never rely on the client to hide admin actions.
 - Planned, not built yet: auth moves to OIDC via Entra ID with this server as BFF. Don't extend the password login in ways that block that.
 
 ## Files agents may touch
