@@ -1,13 +1,19 @@
 import { createServer } from 'node:http';
 import { createServer as createVite } from 'vite';
-import { openDb, seedAdmin } from './db.ts';
-import { createHandler } from './app.ts';
+import { openDb } from './db.ts';
+import { createHandler, oidcConfigFromEnv } from './app.ts';
 
+// Microsoft sign-in is the only way in, so the app refuses to start without its config.
+const oidc = (() => {
+  try {
+    return oidcConfigFromEnv(process.env);
+  } catch (e) {
+    console.error((e as Error).message);
+    process.exit(1);
+  }
+})();
 const db = openDb(process.env.DB_PATH ?? 'booking.db');
-seedAdmin(db);
-const { OIDC_ISSUER: issuer, OIDC_CLIENT_ID: clientId, OIDC_CLIENT_SECRET: clientSecret, OIDC_REDIRECT_URI: redirectUri } = process.env;
-// Until password login is removed (job 003), missing OIDC config only disables "Sign in with Microsoft".
-const api = createHandler(db, issuer && clientId && clientSecret && redirectUri ? { issuer, clientId, clientSecret, redirectUri } : undefined);
+const api = createHandler(db, oidc);
 const port = Number(process.env.PORT ?? 3000);
 
 // One server: /api goes to the API, everything else to Vite (UI with hot reload).

@@ -39,7 +39,7 @@ export function App() {
   };
 
   if (loading) return null;
-  if (!user) return <Login onLogin={setUser} initialError={loginError ? 'Sign-in failed, try again' : ''} />;
+  if (!user) return <Login error={loginError ? 'Sign-in failed, try again' : ''} />;
   return (
     <>
       <header>
@@ -53,30 +53,11 @@ export function App() {
   );
 }
 
-function Login({ onLogin, initialError }: { onLogin: (u: User) => void; initialError: string }) {
-  const [name, setName] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState(initialError);
-
-  const submit = async () => {
-    try {
-      onLogin((await api<{ user: User }>('POST', '/login', { name, password })).user);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  };
-
+function Login({ error }: { error: string }) {
   return (
     <div className="login card">
       <h1>Desk Booking</h1>
       <a className="button" href="/api/login">Sign in with Microsoft</a>
-      <p className="muted">or log in with a password</p>
-      <form onSubmit={(e) => { e.preventDefault(); submit(); }}>
-        <label>Name<input value={name} onChange={(e) => setName(e.target.value)} required autoComplete="username" /></label>
-        <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="current-password" /></label>
-        <button>Log in</button>
-      </form>
-      <p className="muted">No account? Ask an admin to add you.</p>
       {error && <p className="error" role="alert">{error}</p>}
     </div>
   );
@@ -90,7 +71,7 @@ function Booker({ user }: { user: User }) {
   const [start, setStart] = useState('09:00');
   const [end, setEnd] = useState('17:00');
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'book' | 'rooms' | 'users'>('book');
+  const [tab, setTab] = useState<'book' | 'rooms'>('book');
 
   const load = useCallback(async () => {
     const from = new Date(`${date}T00:00`);
@@ -126,7 +107,7 @@ function Booker({ user }: { user: User }) {
     }))();
   };
 
-  const tabs = [['book', 'Bookings'], ['rooms', 'Manage rooms'], ['users', 'Add user']] as const;
+  const tabs = [['book', 'Bookings'], ['rooms', 'Manage rooms']] as const;
 
   return (
     <>
@@ -141,7 +122,6 @@ function Booker({ user }: { user: User }) {
       )}
       {error && <p className="error" role="alert">{error}</p>}
       {tab === 'rooms' && <RoomAdmin rooms={rooms} act={act} />}
-      {tab === 'users' && <UserAdmin act={act} />}
       {tab === 'book' && <>
       <form onSubmit={book}>
         <label>Date<input type="date" value={date} onChange={(e) => setDate(e.target.value)} required /></label>
@@ -179,27 +159,6 @@ function Booker({ user }: { user: User }) {
       </div>
       </>}
     </>
-  );
-}
-
-function UserAdmin({ act }: { act: (fn: () => Promise<unknown>) => () => Promise<void> }) {
-  const [name, setName] = useState('');
-  const [password, setPassword] = useState('');
-
-  const add = (e: FormEvent) => {
-    e.preventDefault();
-    act(() => api('POST', '/users', { name, password }).then(() => { setName(''); setPassword(''); }))();
-  };
-
-  return (
-    <section>
-      <h2>Add user</h2>
-      <form onSubmit={add}>
-        <label>Name<input value={name} onChange={(e) => setName(e.target.value)} required maxLength={50} autoComplete="off" /></label>
-        <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={4} maxLength={200} autoComplete="new-password" /></label>
-        <button>Add user</button>
-      </form>
-    </section>
   );
 }
 

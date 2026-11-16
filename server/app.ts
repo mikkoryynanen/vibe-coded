@@ -2,7 +2,6 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import * as client from 'openid-client';
-import { checkPassword, hashPassword } from './db.ts';
 
 type User = { id: number; name: string; admin: number };
 export type OidcConfig = { issuer: string; clientId: string; clientSecret: string; redirectUri: string };
@@ -62,13 +61,19 @@ const logOidcFailure = (step: string, e: unknown) => {
 // OIDC sessions end after this, so the next silent sign-in re-reads the Entra roles.
 const OIDC_SESSION_MS = 15 * 60 * 1000;
 
-export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
+/** Reads the four required OIDC_* vars; throws naming the missing ones (never their values). */
+export function oidcConfigFromEnv(env: Record<string, string | undefined>): OidcConfig {
+  const missing = ['OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_REDIRECT_URI'].filter((k) => !env[k]?.trim());
+  if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  return { issuer: env.OIDC_ISSUER!, clientId: env.OIDC_CLIENT_ID!, clientSecret: env.OIDC_CLIENT_SECRET!, redirectUri: env.OIDC_REDIRECT_URI! };
+}
+
+export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
   const q = {
-    userByName: db.prepare('SELECT id, name, admin, pass FROM users WHERE name = ?'),
+    userByName: db.prepare('SELECT id FROM users WHERE name = ?'),
     userByOid: db.prepare('SELECT id FROM users WHERE oid = ?'),
     userByToken: db.prepare('SELECT u.id, u.name, u.admin, s.expires_at AS expiresAt FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
-    addUser: db.prepare('INSERT INTO users (name, pass) VALUES (?, ?)'),
-    addOidcUser: db.prepare("INSERT INTO users (name, pass, admin, oid) VALUES (?, '', ?, ?)"),
+    addOidcUser: db.prepare('INSERT INTO users (name, admin, oid) VALUES (?, ?, ?)'),
     updateOidcUser: db.prepare('UPDATE users SET name = ?, admin = ? WHERE id = ?'),
     addSession: db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)'),
     delSession: db.prepare('DELETE FROM sessions WHERE token = ?'),
@@ -87,8 +92,7 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
     delBooking: db.prepare('DELETE FROM bookings WHERE id = ?'),
   };
 
-  // expiresAt null: password sessions keep no server expiry until password login is removed (job 003).
-  function startSession(user: { id: number; name: string; admin: number }, expiresAt: number | null = null) {
+  function startSession(user: { id: number; name: string; admin: number }, expiresAt: number) {
     const token = randomBytes(32).toString('base64url');
     q.addSession.run(token, user.id, expiresAt);
     return { token, user: { id: user.id, name: user.name, admin: !!user.admin } };
@@ -100,7 +104,6 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
 
   let discovered: Promise<client.Configuration> | undefined;
   const oidcClient = () => {
-    if (!oidc) throw new Error('OIDC is not configured (OIDC_* env vars missing)');
     const { hostname, protocol } = new URL(oidc.issuer);
     // Plain http only for a local mock provider; Entra is always https.
     const insecure = protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1');
@@ -114,7 +117,7 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
     const [verifier, state, nonce] = flow.split('.');
     if (!verifier || !state || !nonce) throw new Error('OIDC flow cookie missing or expired');
     const config = await oidcClient();
-    const currentUrl = new URL(url.pathname + url.search, oidc!.redirectUri);
+    const currentUrl = new URL(url.pathname + url.search, oidc.redirectUri);
     const tokens = await client.authorizationCodeGrant(config, currentUrl, { pkceCodeVerifier: verifier, expectedState: state, expectedNonce: nonce, idTokenExpected: true });
     const claims = tokens.claims()!;
     if (typeof claims.oid !== 'string' || !claims.oid) throw new Error('ID token has no oid claim');
@@ -143,7 +146,7 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
         const nonce = client.randomNonce();
         const silent = url.searchParams.get('silent') === '1';
         const target = client.buildAuthorizationUrl(config, {
-          redirect_uri: oidc!.redirectUri,
+          redirect_uri: oidc.redirectUri,
           scope: 'openid profile email',
           code_challenge: await client.calculatePKCECodeChallenge(verifier),
           code_challenge_method: 'S256',
@@ -175,16 +178,6 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
       }
     }
 
-    if (method === 'POST' && path === '/api/login') {
-      // Cross-site forms cannot send application/json, so this blocks login CSRF.
-      if (!/^application\/json\s*(;|$)/i.test(req.headers['content-type'] ?? '')) throw new HttpError(415, 'Expected application/json');
-      const row = q.userByName.get(String(body.name ?? '')) as (User & { pass: string }) | undefined;
-      if (!row || !checkPassword(String(body.password ?? ''), row.pass)) throw new HttpError(401, 'Wrong name or password');
-      const { token, user } = startSession(row);
-      res.setHeader('Set-Cookie', sessionCookie(token, 60 * 60 * 24 * 30));
-      return { user };
-    }
-
     const token = cookie(req, 'session');
     const user = q.userByToken.get(token) as (User & { expiresAt: number | null }) | undefined;
     if (!user) throw new HttpError(401, 'Not logged in');
@@ -194,7 +187,8 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
       res.setHeader('Set-Cookie', sessionCookie('', 0));
       return {};
     }
-    if (user.expiresAt !== null && user.expiresAt <= Date.now()) {
+    // NULL expiry is a leftover password session from before Microsoft sign-in only; treat it as expired.
+    if (user.expiresAt === null || user.expiresAt <= Date.now()) {
       // Deleting the row first means a failed silent re-sign-in ends in a plain 401, so the client cannot loop.
       q.delSession.run(token);
       res.setHeader('Set-Cookie', sessionCookie('', 0));
@@ -204,13 +198,6 @@ export function createHandler(db: DatabaseSync, oidc?: OidcConfig) {
     const requireAdmin = () => { if (!user.admin) throw new HttpError(403, 'Admins only'); };
 
     if (method === 'GET' && path === '/api/me') return { id: user.id, name: user.name, admin: !!user.admin };
-
-    if (method === 'POST' && path === '/api/users') {
-      requireAdmin();
-      const name = text(body.name, 'Name');
-      const password = text(body.password, 'Password', 4, 200);
-      return { id: Number(q.addUser.run(name, hashPassword(password)).lastInsertRowid) };
-    }
 
     if (path === '/api/rooms') {
       if (method === 'GET') return q.rooms.all();

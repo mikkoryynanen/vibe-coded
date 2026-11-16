@@ -7,45 +7,66 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { OAuth2Issuer, OAuth2Server } from 'oauth2-mock-server';
-import { openDb, seedAdmin } from './db.ts';
-import { createHandler } from './app.ts';
+import { openDb } from './db.ts';
+import { createHandler, oidcConfigFromEnv } from './app.ts';
 
-function startServer(t: TestContext) {
+const usersCount = (db: DatabaseSync) => Number(db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n);
+const setCookie = (res: Response, name: string) => res.headers.getSetCookie().find((c) => c.startsWith(`${name}=`));
+const cookieValue = (res: Response, name: string) => setCookie(res, name)?.match(/^[^=]+=([^;]*)/)?.[1] ?? '';
+
+type Tamper = (cb: URL, flow: string) => string | null | Promise<string | null>;
+
+async function startOidc(t: TestContext) {
+  const mock = new OAuth2Server();
+  await mock.issuer.keys.generate('RS256');
+  await mock.start(0, 'localhost');
+  t.after(() => mock.stop());
+  let claims: Record<string, unknown> = {};
+  mock.service.on('beforeTokenSigning', (token) => Object.assign(token.payload, claims));
+
   const db = openDb(':memory:');
-  seedAdmin(db, 'admin-pass');
-  const server = createServer(createHandler(db)).listen(0);
+  const server = createServer().listen(0);
   t.after(() => server.close());
-  return { db, base: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api` };
+  const origin = `http://localhost:${(server.address() as AddressInfo).port}`;
+  server.on('request', createHandler(db, { issuer: mock.issuer.url!, clientId: 'test-client', clientSecret: 'test-secret', redirectUri: `${origin}/api/callback` }));
+  const base = `${origin}/api`;
+
+  /** Runs login -> mock authorize -> callback. `tamper` may change the callback URL and returns the flow cookie to send. */
+  async function signIn(next: Record<string, unknown>, opts: { silent?: boolean; tamper?: Tamper } = {}) {
+    claims = next;
+    const login = await fetch(`${base}/login${opts.silent ? '?silent=1' : ''}`, { redirect: 'manual' });
+    assert.equal(login.status, 302);
+    const flow = cookieValue(login, 'oidc');
+    const authorizeUrl = new URL(login.headers.get('location')!);
+    const authz = await fetch(authorizeUrl, { redirect: 'manual' });
+    const cb = new URL(authz.headers.get('location')!);
+    const sent = opts.tamper ? await opts.tamper(cb, flow) : flow;
+    const res = await fetch(cb, { redirect: 'manual', headers: sent === null ? {} : { Cookie: `oidc=${sent}` } });
+    return { res, token: cookieValue(res, 'session'), location: res.headers.get('location'), authorizeUrl };
+  }
+  const call = async (method: string, path: string, token?: string, body?: object) => {
+    const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token && { Cookie: `session=${token}` }) }, body: body && JSON.stringify(body) });
+    return { status: res.status, data: await res.json(), res };
+  };
+  return { mock, db, base, signIn, call };
 }
 
-const sessionToken = (res: Response) => res.headers.get('set-cookie')?.match(/^session=([^;]*)/)?.[1] ?? '';
+/** A session row inserted directly, as Microsoft sign-in would leave it. */
+function addSession(db: DatabaseSync, name: string, expiresAt: number | null = Date.now() + 60_000) {
+  const userId = Number(db.prepare('INSERT INTO users (name, admin, oid) VALUES (?, 0, ?)').run(name, `oid-${name}`).lastInsertRowid);
+  const token = `tok-${name}`;
+  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').run(token, userId, expiresAt);
+  return token;
+}
 
 test('booking flow', async (t) => {
-  const { base } = startServer(t);
-
-  const call = async (method: string, path: string, token?: string, body?: object) => {
-    const res = await fetch(base + path, {
-      method,
-      headers: { 'Content-Type': 'application/json', ...(token && { Cookie: `session=${token}` }) },
-      body: body && JSON.stringify(body),
-    });
-    return { status: res.status, data: await res.json(), token: sessionToken(res) };
-  };
-
+  const { signIn, call } = await startOidc(t);
   assert.equal((await call('GET', '/rooms')).status, 401);
-  assert.equal((await call('POST', '/login', undefined, { name: 'admin', password: 'nope' })).status, 401);
-
-  const admin = (await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' })).token;
   assert.equal((await call('POST', '/register', undefined, { name: 'eve', password: 'password' })).status, 401, 'no self-registration');
-  assert.equal((await call('POST', '/users', undefined, { name: 'eve', password: 'password' })).status, 401);
-  assert.equal((await call('POST', '/users', admin, { name: 'alice', password: 'pass' })).status, 200);
-  assert.equal((await call('POST', '/users', admin, { name: 'bob', password: 'password2' })).status, 200);
-  assert.equal((await call('POST', '/users', admin, { name: 'Alice', password: 'password3' })).status, 409);
-  assert.equal((await call('POST', '/users', admin, { name: 'carol', password: 'abc' })).status, 400);
-  const login = async (name: string, password: string) => (await call('POST', '/login', undefined, { name, password })).token;
-  const alice = await login('alice', 'pass');
-  const bob = await login('bob', 'password2');
-  assert.equal((await call('POST', '/users', alice, { name: 'mallory', password: 'password' })).status, 403);
+
+  const admin = (await signIn({ oid: 'oid-admin', name: 'admin', roles: ['Admin'] })).token;
+  const alice = (await signIn({ oid: 'oid-alice', name: 'alice' })).token;
+  const bob = (await signIn({ oid: 'oid-bob', name: 'bob' })).token;
 
   assert.equal((await call('POST', '/rooms', alice, { name: 'Desk 1' })).status, 403);
   const roomId = (await call('POST', '/rooms', admin, { name: 'Desk 1' })).data.id;
@@ -74,99 +95,77 @@ test('booking flow', async (t) => {
 });
 
 test('session cookie', async (t) => {
-  const { base, db } = startServer(t);
-  const post = (path: string, headers: Record<string, string>, body?: object) =>
-    fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: body && JSON.stringify(body) });
+  const { db, base, call } = await startOidc(t);
+  const token = addSession(db, 'carol');
   const me = (headers: Record<string, string>) => fetch(base + '/me', { headers });
-
-  const creds = JSON.stringify({ name: 'admin', password: 'admin-pass' });
-  for (const type of [undefined, 'text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', 'application/jsonx']) {
-    const r = await fetch(base + '/login', { method: 'POST', headers: type ? { 'Content-Type': type } : {}, body: new Blob([creds]) });
-    assert.ok(r.status >= 400 && r.status < 500, `${type}: ${r.status}`);
-    assert.equal(r.headers.get('set-cookie'), null, `${type} sets no cookie`);
-  }
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sessions').get()?.n, 0, 'no session rows from rejected logins');
-  const charset = await post('/login', { 'Content-Type': 'application/json; charset=utf-8' }, { name: 'admin', password: 'admin-pass' });
-  assert.equal(charset.status, 200);
-  assert.ok(sessionToken(charset));
-
-  const bad = await post('/login', {}, { name: 'admin', password: 'nope' });
-  assert.equal(bad.status, 401);
-  assert.equal(bad.headers.get('set-cookie'), null);
-
-  const login = await post('/login', {}, { name: 'admin', password: 'admin-pass' });
-  assert.equal(login.status, 200);
-  const body = await login.json();
-  assert.equal(body.user.name, 'admin');
-  assert.equal('token' in body, false, 'token stays out of the body');
-  const cookie = login.headers.get('set-cookie') ?? '';
-  for (const part of ['HttpOnly', 'SameSite=Lax', 'Path=/', 'Max-Age=2592000', 'Secure'])
-    assert.ok(cookie.split('; ').includes(part), `login cookie has ${part}: ${cookie}`);
-  const token = sessionToken(login);
-  assert.ok(token);
 
   const ok = await me({ Cookie: `other=1; session=${token}` });
   assert.equal(ok.status, 200);
-  assert.equal((await ok.json()).name, 'admin');
+  assert.equal((await ok.json()).name, 'carol');
   for (const headers of [{}, { Cookie: 'session=bogus' }, { Cookie: 'session=' }, { Authorization: `Bearer ${token}` }] as Record<string, string>[]) {
     const r = await me(headers);
     assert.equal(r.status, 401, JSON.stringify(headers));
     assert.equal((await r.json()).error, 'Not logged in');
   }
 
-  const out = await post('/logout', { Cookie: `session=${token}` });
+  const out = await call('POST', '/logout', token);
   assert.equal(out.status, 200);
-  const cleared = out.headers.get('set-cookie') ?? '';
+  const cleared = out.res.headers.get('set-cookie') ?? '';
   assert.ok(cleared.startsWith('session=;'), cleared);
   assert.ok(cleared.includes('Max-Age=0') && cleared.includes('Secure'), cleared);
-  assert.equal((await me({ Cookie: `session=${token}` })).status, 401);
+  assert.equal((await call('GET', '/me', token)).status, 401);
 
-  const again = await post('/logout', { Cookie: `session=${token}` });
+  const again = await call('POST', '/logout', token);
   assert.equal(again.status, 401, 'logout without a valid session stays 401');
-  assert.equal(again.headers.get('set-cookie'), null);
+  assert.equal(again.res.headers.get('set-cookie'), null);
 });
 
-const usersCount = (db: DatabaseSync) => Number(db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n);
-const setCookie = (res: Response, name: string) => res.headers.getSetCookie().find((c) => c.startsWith(`${name}=`));
-const cookieValue = (res: Response, name: string) => setCookie(res, name)?.match(/^[^=]+=([^;]*)/)?.[1] ?? '';
+test('password login and user creation are gone', async (t) => {
+  const { db, signIn, call } = await startOidc(t);
+  // An old password user (its hash went with the dropped pass column) cannot sign in any more.
+  db.prepare("INSERT INTO users (name, admin) VALUES ('admin', 1)").run();
+  const users = usersCount(db);
+  const sessions = () => Number(db.prepare('SELECT COUNT(*) AS n FROM sessions').get()?.n);
 
-type Tamper = (cb: URL, flow: string) => string | null | Promise<string | null>;
+  const pw = await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' });
+  assert.equal(pw.status, 401);
+  assert.equal(setCookie(pw.res, 'session'), undefined);
+  assert.equal(sessions(), 0);
+  assert.equal((await call('POST', '/users', undefined, { name: 'eve', password: 'password' })).status, 401);
 
-async function startOidc(t: TestContext) {
-  const mock = new OAuth2Server();
-  await mock.issuer.keys.generate('RS256');
-  await mock.start(0, 'localhost');
-  t.after(() => mock.stop());
-  let claims: Record<string, unknown> = {};
-  mock.service.on('beforeTokenSigning', (token) => Object.assign(token.payload, claims));
+  const admin = (await signIn({ oid: 'oid-root', name: 'Root', roles: ['Admin'] })).token;
+  const user = (await signIn({ oid: 'oid-user', name: 'User' })).token;
+  assert.equal((await call('POST', '/login', admin, { name: 'admin', password: 'admin-pass' })).status, 404);
+  assert.equal((await call('POST', '/users', admin, { name: 'eve', password: 'password' })).status, 404);
+  assert.equal((await call('POST', '/users', user, { name: 'eve', password: 'password' })).status, 404);
+  assert.equal(usersCount(db), users + 2, 'only the two Microsoft sign-ins added users');
+  assert.equal(db.prepare("SELECT 1 FROM users WHERE name = 'eve'").get(), undefined);
+});
 
-  const db = openDb(':memory:');
-  seedAdmin(db, 'admin-pass');
-  const server = createServer().listen(0);
-  t.after(() => server.close());
-  const origin = `http://localhost:${(server.address() as AddressInfo).port}`;
-  server.on('request', createHandler(db, { issuer: mock.issuer.url!, clientId: 'test-client', clientSecret: 'test-secret', redirectUri: `${origin}/api/callback` }));
-  const base = `${origin}/api`;
+test('a session without expiry (old password session) asks for reauth', async (t) => {
+  const { db, call } = await startOidc(t);
+  const token = addSession(db, 'legacy', null);
+  const res = await call('GET', '/me', token);
+  assert.equal(res.status, 401);
+  assert.deepEqual(res.data, { error: 'Session expired', reauth: true });
+  assert.equal(db.prepare('SELECT 1 FROM sessions WHERE token = ?').get(token), undefined, 'row deleted');
+});
 
-  /** Runs login -> mock authorize -> callback. `tamper` may change the callback URL and returns the flow cookie to send. */
-  async function signIn(next: Record<string, unknown>, opts: { silent?: boolean; tamper?: Tamper } = {}) {
-    claims = next;
-    const login = await fetch(`${base}/login${opts.silent ? '?silent=1' : ''}`, { redirect: 'manual' });
-    assert.equal(login.status, 302);
-    const flow = cookieValue(login, 'oidc');
-    const authorizeUrl = new URL(login.headers.get('location')!);
-    const authz = await fetch(authorizeUrl, { redirect: 'manual' });
-    const cb = new URL(authz.headers.get('location')!);
-    const sent = opts.tamper ? await opts.tamper(cb, flow) : flow;
-    const res = await fetch(cb, { redirect: 'manual', headers: sent === null ? {} : { Cookie: `oidc=${sent}` } });
-    return { res, token: cookieValue(res, 'session'), location: res.headers.get('location'), authorizeUrl };
+test('oidcConfigFromEnv requires all four OIDC vars', () => {
+  const env = { OIDC_ISSUER: 'https://issuer', OIDC_CLIENT_ID: 'id', OIDC_CLIENT_SECRET: 'top-secret-value', OIDC_REDIRECT_URI: 'http://localhost/api/callback' };
+  assert.deepEqual(oidcConfigFromEnv(env), { issuer: 'https://issuer', clientId: 'id', clientSecret: 'top-secret-value', redirectUri: 'http://localhost/api/callback' });
+  assert.throws(() => oidcConfigFromEnv({}), /OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI/);
+  for (const key of Object.keys(env)) {
+    for (const value of [undefined, '', '  ']) {
+      assert.throws(() => oidcConfigFromEnv({ ...env, [key]: value }), (e: Error) => {
+        assert.ok(e.message.includes(key), e.message);
+        assert.ok(!e.message.includes('top-secret-value'), 'secret value never in the message');
+        assert.equal(e.message.split(',').length, 1, 'only the missing var is named');
+        return true;
+      });
+    }
   }
-  const call = async (method: string, path: string, token?: string, body?: object) => {
-    const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token && { Cookie: `session=${token}` }) }, body: body && JSON.stringify(body) });
-    return { status: res.status, data: await res.json(), res };
-  };
-  return { mock, db, base, signIn, call };
-}
+});
 
 test('oidc login redirect and flow cookie', async (t) => {
   const { base, signIn } = await startOidc(t);
@@ -206,7 +205,7 @@ test('oidc sign-in creates, reuses and updates the user', async (t) => {
   assert.equal(me.status, 200);
   assert.deepEqual({ name: me.data.name, admin: me.data.admin }, { name: 'Alice Entra', admin: true });
   assert.equal(usersCount(db), before + 1);
-  assert.equal(db.prepare('SELECT pass FROM users WHERE oid = ?').get('oid-alice-1234')?.pass, '');
+  assert.deepEqual({ ...db.prepare('SELECT * FROM users WHERE oid = ?').get('oid-alice-1234') }, { id: me.data.id, name: 'Alice Entra', admin: 1, oid: 'oid-alice-1234' }, 'no pass column');
 
   const second = await signIn({ oid: 'oid-alice-1234', name: 'Alice Entra' });
   const me2 = await call('GET', '/me', second.token);
@@ -226,10 +225,6 @@ test('oidc sign-in creates, reuses and updates the user', async (t) => {
   const alice = await signIn({ oid: 'oid-alice-1234', name: 'Alice Entra' });
   assert.equal((await call('GET', '/me', alice.token)).data.name, 'Alice Entra');
 
-  const pw = await call('POST', '/login', undefined, { name: 'Alice Entra', password: 'anything' });
-  assert.equal(pw.status, 401, 'password login on an OIDC user is 401, not 500');
-  assert.equal(pw.res.headers.get('set-cookie'), null);
-  assert.equal((await call('POST', '/login', undefined, { name: 'Alice Entra', password: '' })).status, 401);
 });
 
 test('oidc sessions expire and ask for a silent re-sign-in', async (t) => {
@@ -260,22 +255,17 @@ test('oidc sessions expire and ask for a silent re-sign-in', async (t) => {
   assert.equal((await call('POST', '/logout')).status, 401, 'logout without a session cookie stays 401');
   assert.equal((await call('POST', '/logout', leaving)).status, 401);
 
-  const pw = await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' });
-  const pwToken = cookieValue(pw.res, 'session');
-  assert.equal(db.prepare('SELECT expires_at AS e FROM sessions WHERE token = ?').get(pwToken)?.e, null, 'password sessions keep no expiry');
-  assert.equal((await call('GET', '/me', pwToken)).status, 200);
   assert.equal((await fetch(`${base}/me`)).status, 401);
 });
 
 test('non-admin oidc user is still bound by admin and ownership checks', async (t) => {
   const { signIn, call } = await startOidc(t);
-  const admin = cookieValue((await call('POST', '/login', undefined, { name: 'admin', password: 'admin-pass' })).res, 'session');
+  const admin = (await signIn({ oid: 'oid-admin', name: 'Admin', roles: ['Admin'] })).token;
   const roomId = (await call('POST', '/rooms', admin, { name: 'Desk 1' })).data.id;
   const adminBooking = (await call('POST', '/bookings', admin, { roomId, start: '2030-01-01T09:00Z', end: '2030-01-01T10:00Z' })).data.id;
   const { token } = await signIn({ oid: 'oid-bob', name: 'Bob', roles: ['Reader'] });
   assert.equal((await call('GET', '/me', token)).data.admin, false);
   assert.equal((await call('POST', '/rooms', token, { name: 'Desk 2' })).status, 403);
-  assert.equal((await call('POST', '/users', token, { name: 'eve', password: 'password' })).status, 403);
   assert.equal((await call('DELETE', `/bookings/${adminBooking}`, token)).status, 403);
   assert.equal((await call('GET', '/me')).status, 401);
 });
@@ -336,20 +326,6 @@ test('oidc failures redirect to a generic error and create nothing', async (t) =
   assert.equal(ok.location, '/', 'the provider still works after the failures');
 });
 
-test('oidc without config', async (t) => {
-  const { base } = startServer(t);
-  for (const path of ['/login', '/login?silent=1', '/callback?code=abc&state=def']) {
-    const res = await fetch(base + path, { redirect: 'manual', headers: { Cookie: 'oidc=a.b.c.0' } });
-    assert.equal(res.status, 302, path);
-    assert.equal(res.headers.get('location'), '/?login_error=1', path);
-    assert.equal(setCookie(res, 'session'), undefined, path);
-  }
-  const pw = await fetch(base + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'admin', password: 'admin-pass' }) });
-  assert.equal(pw.status, 200, 'password login still works');
-  const form = await fetch(base + '/login', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
-  assert.equal(form.status, 415);
-});
-
 test('openDb upgrades an old-schema database in place', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'booking-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -358,18 +334,29 @@ test('openDb upgrades an old-schema database in place', (t) => {
   old.exec(`
     CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL COLLATE NOCASE, pass TEXT NOT NULL, admin INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE);
+    CREATE TABLE rooms (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL COLLATE NOCASE);
+    CREATE TABLE bookings (id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL REFERENCES rooms ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE, start_at TEXT NOT NULL, end_at TEXT NOT NULL);
     INSERT INTO users (name, pass, admin) VALUES ('old', 'salt:hash', 1);
+    INSERT INTO rooms (name) VALUES ('Desk 1');
+    INSERT INTO bookings (room_id, user_id, start_at, end_at) VALUES (1, 1, 'a', 'b');
     INSERT INTO sessions (token, user_id) VALUES ('tok', 1);`);
   old.close();
 
   for (let i = 0; i < 2; i++) {
     const db = openDb(path);
     const cols = (table: string) => (db.prepare('SELECT name FROM pragma_table_info(?)').all(table) as { name: string }[]).map((c) => c.name);
-    assert.ok(cols('users').includes('oid'));
+    assert.deepEqual(cols('users'), ['id', 'name', 'admin', 'oid'], 'pass column dropped');
     assert.ok(cols('sessions').includes('expires_at'));
     assert.equal(db.prepare("SELECT \"unique\" AS u FROM pragma_index_list('users') WHERE name = 'users_oid'").get()?.u, 1);
-    assert.deepEqual({ ...db.prepare('SELECT name, pass, admin, oid FROM users').get() }, { name: 'old', pass: 'salt:hash', admin: 1, oid: null });
+    assert.deepEqual({ ...db.prepare('SELECT * FROM users').get() }, { id: 1, name: 'old', admin: 1, oid: null });
+    assert.deepEqual({ ...db.prepare('SELECT room_id, user_id, start_at, end_at FROM bookings').get() }, { room_id: 1, user_id: 1, start_at: 'a', end_at: 'b' });
     assert.deepEqual({ ...db.prepare('SELECT token, user_id, expires_at FROM sessions').get() }, { token: 'tok', user_id: 1, expires_at: null });
     db.close();
   }
+});
+
+test('a fresh database has no pass column', () => {
+  const db = openDb(':memory:');
+  assert.deepEqual((db.prepare("SELECT name FROM pragma_table_info('users')").all() as { name: string }[]).map((c) => c.name), ['id', 'name', 'admin', 'oid']);
 });
