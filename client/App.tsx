@@ -11,6 +11,11 @@ async function api<T = unknown>(method: string, path: string, body?: object): Pr
     body: body && JSON.stringify(body),
   });
   const data = await res.json();
+  // Expired Microsoft session: re-check roles silently. The server already dropped the session, so this cannot loop.
+  if (res.status === 401 && data.reauth) {
+    location.assign('/api/login?silent=1');
+    return new Promise<T>(() => {}); // keep the current screen while the browser navigates away
+  }
   if (!res.ok) throw new Error(data.error ?? res.statusText);
   return data;
 }
@@ -21,10 +26,12 @@ const hhmm = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-di
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loginError] = useState(() => new URLSearchParams(location.search).has('login_error'));
 
   useEffect(() => {
+    if (loginError) history.replaceState(null, '', location.pathname);
     api<User>('GET', '/me').then(setUser, () => {}).finally(() => setLoading(false));
-  }, []);
+  }, [loginError]);
 
   const logout = async () => {
     await api('POST', '/logout').catch(() => {});
@@ -32,7 +39,7 @@ export function App() {
   };
 
   if (loading) return null;
-  if (!user) return <Login onLogin={setUser} />;
+  if (!user) return <Login onLogin={setUser} initialError={loginError ? 'Sign-in failed, try again' : ''} />;
   return (
     <>
       <header>
@@ -46,10 +53,10 @@ export function App() {
   );
 }
 
-function Login({ onLogin }: { onLogin: (u: User) => void }) {
+function Login({ onLogin, initialError }: { onLogin: (u: User) => void; initialError: string }) {
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(initialError);
 
   const submit = async () => {
     try {
@@ -62,6 +69,8 @@ function Login({ onLogin }: { onLogin: (u: User) => void }) {
   return (
     <div className="login card">
       <h1>Desk Booking</h1>
+      <a className="button" href="/api/login">Sign in with Microsoft</a>
+      <p className="muted">or log in with a password</p>
       <form onSubmit={(e) => { e.preventDefault(); submit(); }}>
         <label>Name<input value={name} onChange={(e) => setName(e.target.value)} required autoComplete="username" /></label>
         <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="current-password" /></label>

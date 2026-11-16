@@ -19,6 +19,11 @@ export function openDb(path: string) {
       start_at TEXT NOT NULL, end_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS bookings_room_time ON bookings (room_id, start_at);
   `);
+  // Existing databases predate these columns; CREATE TABLE IF NOT EXISTS does not add them.
+  const hasColumn = (table: string, column: string) => !!db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column);
+  if (!hasColumn('users', 'oid')) db.exec('ALTER TABLE users ADD COLUMN oid TEXT');
+  if (!hasColumn('sessions', 'expires_at')) db.exec('ALTER TABLE sessions ADD COLUMN expires_at INTEGER');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS users_oid ON users (oid)');
   return db;
 }
 
@@ -28,8 +33,11 @@ export function hashPassword(password: string) {
 }
 
 export function checkPassword(password: string, stored: string) {
-  const [salt, hash] = stored.split(':');
-  return timingSafeEqual(Buffer.from(hash, 'hex'), scryptSync(password, salt, 64));
+  const [salt, hash = ''] = stored.split(':');
+  const expected = Buffer.from(hash, 'hex');
+  // OIDC users store pass = '', which must fail instead of throwing in timingSafeEqual.
+  if (!salt || expected.length !== 64) return false;
+  return timingSafeEqual(expected, scryptSync(password, salt, 64));
 }
 
 /** Creates the `admin` account on first run so someone can manage rooms. */

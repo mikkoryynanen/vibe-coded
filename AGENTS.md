@@ -7,7 +7,9 @@ Desk booking app: React UI (Vite) + plain Node HTTP API on built-in `node:sqlite
 - `server/app.ts` — `createHandler`: all API routes, sessions, authorization checks
 - `server/db.ts` — schema (`openDb`), admin seeding, password hashing
 - `server/index.ts` — entry point; serves API + Vite dev middleware on one port
-- `server/app.test.ts` — API tests
+- `server/app.test.ts` — API tests (Microsoft sign-in runs against `oauth2-mock-server`)
+- `server/mock-oidc.ts` — dev-only local OIDC provider for trying Microsoft sign-in without Entra
+- `server/dev-env.ts` — loads `.env` for `npm run dev` (not `--env-file`: with `--watch-path` it restart-loops the server)
 - `client/App.tsx` — the whole UI; `client/styles.css` — styles
 
 ## Commands
@@ -28,7 +30,7 @@ Desk booking app: React UI (Vite) + plain Node HTTP API on built-in `node:sqlite
 These are mandatory. A change that breaks one is not done, even if tests pass. If a task seems to need breaking one, stop and ask.
 
 **Access control**
-- Every route except `POST /api/login` requires a valid session. New routes go after the session check in `route()`, never before it.
+- Every route except `POST /api/login` (password), `GET /api/login` and `GET /api/callback` (Microsoft sign-in) requires a valid session. New routes go after the session check in `route()`, never before it.
 - Admin-only actions call `requireAdmin()` on the server. Hiding a button in the UI is not authorization.
 - Ownership is checked on the server: a user may only change or delete their own bookings (admins excepted). The user id comes from the session, never from the request body or URL.
 - Deny by default: unknown paths and methods return 404; a missing check is a bug, not a feature.
@@ -48,18 +50,18 @@ These are mandatory. A change that breaks one is not done, even if tests pass. I
 - No new dependency without asking (see Conventions). Run `npm audit` when adding or upgrading one and report high/critical findings.
 
 **Known gaps (accepted for now, do not make worse)**
-- Sessions never expire on the server; the `session` cookie expires after 30 days in the browser, and logout is the only server-side way to end one.
+- Password sessions never expire on the server; the `session` cookie expires after 30 days in the browser, and logout is the only server-side way to end one. Microsoft sign-in sessions expire on the server after 15 minutes.
+- Revoking the Entra `Admin` role (or disabling the user) takes effect only at the next role re-check, up to 15 minutes. Future fix: near-immediate revocation (for example a Microsoft Graph check on admin actions).
 - No rate limiting on `POST /api/login`.
-- No CSRF token: the session is an HttpOnly, `SameSite=Lax`, `Secure` cookie, so CSRF protection relies on SameSite plus every state change being non-GET, and `POST /api/login` accepting only `application/json` (415 otherwise). Keep GET routes free of side effects and keep that login check. Because the cookie is always `Secure`, plain-http access works only on `localhost`.
+- No CSRF token: the session is an HttpOnly, `SameSite=Lax`, `Secure` cookie, so CSRF protection relies on SameSite plus every state change being non-GET, and `POST /api/login` accepting only `application/json` (415 otherwise). Keep GET routes free of side effects and keep that login check. The exceptions are `GET /api/login` and `GET /api/callback`, the standard OIDC redirect shape: their side effects are limited to the sign-in flow itself, and the callback only signs in when `state` matches the HttpOnly `oidc` flow cookie. Because the cookie is always `Secure`, plain-http access works only on `localhost`.
 - No security headers (CSP etc.) and no HTTPS in the app itself; deployment must put TLS in front.
-- `.env` is not yet in `.gitignore`.
 
 ## Conventions
 
 - Node 24 runs `.ts` directly (type stripping): no enums, namespaces or parameter properties (`erasableSyntaxOnly` enforces this).
 - Relative imports keep the `.ts`/`.tsx` extension; type-only imports use `import type` (`verbatimModuleSyntax`).
 - Prefer Node built-ins (`node:sqlite`, `node:crypto`, `node:test`). No new dependencies without asking.
-- Planned, not built yet: auth moves to OIDC via Entra ID with this server as BFF. Don't extend the password login in ways that block that.
+- Auth is moving to OIDC via Entra ID with this server as BFF: Microsoft sign-in exists, password login is still there until it is removed. Don't extend the password login in ways that block that.
 
 ## Files agents may touch
 

@@ -46,6 +46,42 @@ Optional environment variables:
 
 To start over, stop the server and delete `booking.db`.
 
+## Sign in with Microsoft (Entra ID)
+
+The login screen has a **Sign in with Microsoft** link. It works once these four variables are set; without them the link shows "Sign-in failed, try again" and password login keeps working.
+
+| Variable             | Example                                              |
+|----------------------|------------------------------------------------------|
+| `OIDC_ISSUER`        | `https://login.microsoftonline.com/<tenant-id>/v2.0` (never `/common`) |
+| `OIDC_CLIENT_ID`     | the app registration's client id                     |
+| `OIDC_CLIENT_SECRET` | the app registration's client secret                 |
+| `OIDC_REDIRECT_URI`  | `http://localhost:3000/api/callback`                 |
+
+`npm run dev` loads them from a `.env` file in the repo root if one exists. `.env` is git-ignored; never commit it or paste the secret anywhere else.
+
+One-time setup in the Entra admin center (done by a person):
+
+1. Use a tenant you administer (a free Azure account gives one).
+2. **App registrations → New registration**: single tenant, platform **Web**, redirect URI `http://localhost:3000/api/callback` (deployed: `https://<host>/api/callback`).
+3. **Certificates & secrets → New client secret**. Put the four values above in `.env`. Secrets expire (at most 24 months).
+4. **App roles → Create app role**: display name and value `Admin`, allowed member type Users.
+5. **Enterprise applications → the app → Properties**: Assignment required = Yes. Under **Users and groups**, add the people who may sign in and give admins the `Admin` role.
+
+How it behaves:
+
+- Users are matched by their Entra object id (`oid`). The display name comes from the `name` claim; if another user already has that name, a short id suffix is added.
+- Clicking **Sign in with Microsoft** always shows the Microsoft account picker, so you can choose another account.
+- Admin rights come from the `Admin` app role and are re-read on every sign-in.
+- A Microsoft sign-in session lasts 15 minutes on the server, then the app signs in again silently (no prompt while the Microsoft session lives) and re-reads the role.
+- **Known security gap:** removing the `Admin` role or disabling a user takes effect only at that next re-check, so up to 15 minutes later.
+
+To try it locally without Entra, run the dev-only mock provider and point the app at it:
+
+```sh
+MOCK_PORT=8090 MOCK_ROLES=Admin node server/mock-oidc.ts
+OIDC_ISSUER=http://localhost:8090 OIDC_CLIENT_ID=mock-client OIDC_CLIENT_SECRET=mock-secret OIDC_REDIRECT_URI=http://localhost:3000/api/callback npm run dev
+```
+
 ## Tests
 
 ```sh
