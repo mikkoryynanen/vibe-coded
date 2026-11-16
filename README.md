@@ -4,12 +4,11 @@ A small web app for a team to book desks or meeting rooms by time slot.
 
 ## Features
 
-- **Log in** with a name and password. There is no self-registration: an admin creates every account.
+- **Sign in with Microsoft** (Entra ID) is the only way in. Who may sign in and who is admin is managed in Entra; a user's account here is created on first sign-in.
 - **Bookings** (all users): pick a day, see each room's bookings for that day, and book a room for a start–end time.
   - Overlapping bookings for the same room are rejected; back-to-back bookings are fine.
   - You can cancel your own bookings. Admins can cancel anyone's.
 - **Manage rooms** (admins only): add, rename and delete rooms. Deleting a room also deletes its bookings.
-- **Add user** (admins only): create new user accounts.
 
 The UI is React (Vite); the API is a plain Node HTTP server with a built-in SQLite database (`booking.db`).
 
@@ -26,13 +25,7 @@ npm run dev
 
 Open http://localhost:3000. One server serves both the API (`/api/...`) and the UI, with hot reload.
 
-On the first run the app creates `booking.db` and an `admin` account, and prints the admin password in the terminal:
-
-```
-Created admin account -> name: admin, password: ...
-```
-
-Log in as `admin`, add some rooms under **Manage rooms**, and create users under **Add user**.
+The app needs the four `OIDC_*` variables (see [Sign in with Microsoft](#sign-in-with-microsoft-entra-id)); without them it exits at start and names the missing ones. On the first run it creates `booking.db`. There is no built-in admin account: whoever holds the Entra `Admin` app role is admin. Sign in as an admin and add some rooms under **Manage rooms**.
 
 ## Configuration
 
@@ -40,7 +33,6 @@ Optional environment variables:
 
 | Variable         | Default      | Purpose                                                          |
 |------------------|--------------|------------------------------------------------------------------|
-| `ADMIN_PASSWORD` | random       | Admin password, used only when the admin account is first created |
 | `DB_PATH`        | `booking.db` | SQLite database file                                             |
 | `PORT`           | `3000`       | HTTP port                                                        |
 
@@ -48,7 +40,7 @@ To start over, stop the server and delete `booking.db`.
 
 ## Sign in with Microsoft (Entra ID)
 
-The login screen has a **Sign in with Microsoft** link. It works once these four variables are set; without them the link shows "Sign-in failed, try again" and password login keeps working.
+The login screen has a **Sign in with Microsoft** link. These four variables are required; the server refuses to start without them.
 
 | Variable             | Example                                              |
 |----------------------|------------------------------------------------------|

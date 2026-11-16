@@ -115,7 +115,6 @@ li button:first-of-type { margin-left: auto; }
 
 .login { max-width: 360px; margin: 10vh auto 0; }
 .login h1 { text-align: center; margin-bottom: 4px; }
-.login form { flex-direction: column; align-items: stretch; }
 .login a.button { margin-top: 16px; }
 .login p { text-align: center; }
 
