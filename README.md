@@ -8,6 +8,7 @@ A small web app for a team to book desks or meeting rooms by time slot.
 - **Bookings** (all users): pick a day, see each room's bookings for that day, and book a room for a start–end time.
   - Overlapping bookings for the same room are rejected; back-to-back bookings are fine.
   - You can cancel your own bookings. Admins can cancel anyone's.
+- **My bookings** (all users): a tab listing your own ongoing and upcoming bookings across all days and rooms, soonest first, with a Cancel button for each. Ended bookings are not shown.
 - **Manage rooms** (admins only): add, rename and delete rooms. Deleting a room also deletes its bookings.
 
 The UI is React (Vite); the API is a plain Node HTTP server with a built-in SQLite database (`booking.db`).

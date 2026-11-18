@@ -66,23 +66,26 @@ function Login({ error }: { error: string }) {
 function Booker({ user }: { user: User }) {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [bookings, setBookings] = useState<Booking[]>([]);
+  const [mine, setMine] = useState<Booking[]>([]);
   const [date, setDate] = useState(today);
   const [roomId, setRoomId] = useState('');
   const [start, setStart] = useState('09:00');
   const [end, setEnd] = useState('17:00');
   const [error, setError] = useState('');
-  const [tab, setTab] = useState<'book' | 'rooms'>('book');
+  const [tab, setTab] = useState<'book' | 'mine' | 'rooms'>('book');
 
   const load = useCallback(async () => {
     const from = new Date(`${date}T00:00`);
     const to = new Date(from);
     to.setDate(to.getDate() + 1);
-    const [r, b] = await Promise.all([
+    const [r, b, m] = await Promise.all([
       api<Room[]>('GET', '/rooms'),
       api<Booking[]>('GET', `/bookings?from=${from.toISOString()}&to=${to.toISOString()}`),
+      api<Booking[]>('GET', '/bookings/mine'),
     ]);
     setRooms(r);
     setBookings(b);
+    setMine(m);
   }, [date]);
 
   useEffect(() => { load().catch((e) => setError(e.message)); }, [load]);
@@ -107,21 +110,20 @@ function Booker({ user }: { user: User }) {
     }))();
   };
 
-  const tabs = [['book', 'Bookings'], ['rooms', 'Manage rooms']] as const;
+  const tabs = ([['book', 'Bookings'], ['mine', 'My bookings'], ['rooms', 'Manage rooms']] as const).filter(([id]) => id !== 'rooms' || user.admin);
 
   return (
     <>
-      {user.admin && (
-        <div className="tabs" role="tablist">
-          {tabs.map(([id, label]) => (
-            <button type="button" key={id} role="tab" aria-selected={tab === id} onClick={() => { setTab(id); setError(''); }}>
-              {label}
-            </button>
-          ))}
-        </div>
-      )}
+      <div className="tabs" role="tablist">
+        {tabs.map(([id, label]) => (
+          <button type="button" key={id} role="tab" aria-selected={tab === id} onClick={() => { setTab(id); setError(''); }}>
+            {label}
+          </button>
+        ))}
+      </div>
       {error && <p className="error" role="alert">{error}</p>}
       {tab === 'rooms' && <RoomAdmin rooms={rooms} act={act} />}
+      {tab === 'mine' && <MyBookings bookings={mine} rooms={rooms} act={act} />}
       {tab === 'book' && <>
       <form onSubmit={book}>
         <label>Date<input type="date" value={date} onChange={(e) => setDate(e.target.value)} required /></label>
@@ -159,6 +161,24 @@ function Booker({ user }: { user: User }) {
       </div>
       </>}
     </>
+  );
+}
+
+function MyBookings({ bookings, rooms, act }: { bookings: Booking[]; rooms: Room[]; act: (fn: () => Promise<unknown>) => () => Promise<void> }) {
+  return (
+    <section>
+      <h2>My bookings</h2>
+      {!bookings.length && <p className="muted">You have no upcoming bookings.</p>}
+      <ul>
+        {bookings.map((b) => (
+          <li key={b.id}>
+            {new Date(b.start).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })}{' '}
+            <span className="time">{hhmm(b.start)}–{hhmm(b.end)}</span> {rooms.find((r) => r.id === b.roomId)?.name}
+            <button type="button" className="danger" onClick={act(() => api('DELETE', `/bookings/${b.id}`))}>Cancel</button>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
