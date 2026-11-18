@@ -11,7 +11,7 @@ Desk booking app: React UI (Vite) + plain Node HTTP API on built-in `node:sqlite
 - `server/mock-oidc.ts` — dev-only local OIDC provider for trying Microsoft sign-in without Entra
 - `server/dev-env.ts` — loads `.env` for `npm run dev` (not `--env-file`: with `--watch-path` it restart-loops the server)
 - `client/App.tsx` — the whole UI; `client/styles.css` — styles
-- `.github/workflows/` — CI (lint, build, test, audit), CodeQL, deploy (staging, then prod after approval)
+- `.github/workflows/` — CI (lint, build, test, audit: blocks on high or critical advisories in production dependencies, reports dev-only advisories without failing), CodeQL, deploy (staging, then prod after approval)
 
 ## Commands
 
