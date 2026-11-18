@@ -172,8 +172,10 @@ function MyBookings({ bookings, rooms, act }: { bookings: Booking[]; rooms: Room
       <ul>
         {bookings.map((b) => (
           <li key={b.id}>
-            {new Date(b.start).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })}{' '}
-            <span className="time">{hhmm(b.start)}–{hhmm(b.end)}</span> {rooms.find((r) => r.id === b.roomId)?.name}
+            <span>
+              {new Date(b.start).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' })}{' '}
+              <span className="time">{hhmm(b.start)}–{hhmm(b.end)}</span> {rooms.find((r) => r.id === b.roomId)?.name}
+            </span>
             <button type="button" className="danger" onClick={act(() => api('DELETE', `/bookings/${b.id}`))}>Cancel</button>
           </li>
         ))}
