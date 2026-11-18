@@ -94,6 +94,60 @@ test('booking flow', async (t) => {
   assert.equal(after.data.length, 0, 'deleting a room removes its bookings');
 });
 
+test('my bookings', async (t) => {
+  const { signIn, call } = await startOidc(t);
+  assert.equal((await call('GET', '/bookings/mine')).status, 401);
+
+  const admin = (await signIn({ oid: 'oid-admin', name: 'admin', roles: ['Admin'] })).token;
+  const alice = (await signIn({ oid: 'oid-alice', name: 'alice' })).token;
+  const bob = (await signIn({ oid: 'oid-bob', name: 'bob' })).token;
+  const aliceId = (await call('GET', '/me', alice)).data.id;
+  const adminId = (await call('GET', '/me', admin)).data.id;
+  const roomA = (await call('POST', '/rooms', admin, { name: 'Desk A' })).data.id;
+  const roomB = (await call('POST', '/rooms', admin, { name: 'Desk B' })).data.id;
+
+  const hour = 60 * 60 * 1000;
+  const at = (h: number) => new Date(Date.now() + h * hour).toISOString();
+  const book = async (token: string, roomId: number, from: number, to: number) => {
+    const r = await call('POST', '/bookings', token, { roomId, start: at(from), end: at(to) });
+    assert.equal(r.status, 200);
+    return r.data.id as number;
+  };
+
+  const later = await book(alice, roomB, 48, 49);
+  const ended = await book(alice, roomA, -3, -2);
+  const ongoing = await book(alice, roomA, -1, 1);
+  const soon = await book(alice, roomB, 2, 3);
+  await book(bob, roomA, 4, 5);
+  await book(bob, roomB, -1, 1);
+  const adminOwn = await book(admin, roomA, 6, 7);
+
+  const mine = await call('GET', '/bookings/mine', alice);
+  assert.equal(mine.status, 200);
+  assert.deepEqual(mine.data.map((b: { id: number }) => b.id), [ongoing, soon, later], 'ongoing and upcoming only, by start');
+  assert.ok(!mine.data.some((b: { id: number }) => b.id === ended), 'ended booking excluded');
+  assert.ok(mine.data.every((b: { userId: number }) => b.userId === aliceId), 'only own bookings');
+
+  const day = await call('GET', `/bookings?from=${at(1.5)}&to=${at(3.5)}`, alice);
+  const dayItem = day.data.find((b: { id: number }) => b.id === soon);
+  assert.deepEqual(mine.data.find((b: { id: number }) => b.id === soon), dayItem, 'same shape as GET /bookings');
+  assert.deepEqual(Object.keys(dayItem).sort(), ['end', 'id', 'roomId', 'start', 'userId', 'userName']);
+
+  const adminMine = await call('GET', '/bookings/mine', admin);
+  assert.deepEqual(adminMine.data.map((b: { id: number }) => b.id), [adminOwn], 'admin sees only own bookings');
+  assert.ok(adminMine.data.every((b: { userId: number }) => b.userId === adminId));
+
+  for (const method of ['POST', 'PATCH', 'DELETE']) {
+    assert.equal((await call(method, '/bookings/mine', alice, method === 'DELETE' ? undefined : {})).status, 404, method);
+    assert.equal((await call(method, '/bookings/mine', admin, method === 'DELETE' ? undefined : {})).status, 404, `${method} as admin`);
+  }
+  assert.equal((await call('GET', '/bookings/mine', alice)).data.length, 3, 'nothing deleted by other methods');
+
+  assert.equal((await call('DELETE', `/bookings/${soon}`, bob)).status, 403);
+  assert.equal((await call('DELETE', `/bookings/${soon}`, alice)).status, 200);
+  assert.deepEqual((await call('GET', '/bookings/mine', alice)).data.map((b: { id: number }) => b.id), [ongoing, later]);
+});
+
 test('session cookie', async (t) => {
   const { db, base, call } = await startOidc(t);
   const token = addSession(db, 'carol');

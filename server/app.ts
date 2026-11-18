@@ -86,6 +86,10 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
       SELECT b.id, b.room_id AS roomId, b.user_id AS userId, u.name AS userName, b.start_at AS start, b.end_at AS end
       FROM bookings b JOIN users u ON u.id = b.user_id
       WHERE b.start_at < ? AND b.end_at > ? ORDER BY b.start_at`),
+    myBookings: db.prepare(`
+      SELECT b.id, b.room_id AS roomId, b.user_id AS userId, u.name AS userName, b.start_at AS start, b.end_at AS end
+      FROM bookings b JOIN users u ON u.id = b.user_id
+      WHERE b.user_id = ? AND b.end_at > ? ORDER BY b.start_at`),
     clash: db.prepare('SELECT 1 FROM bookings WHERE room_id = ? AND start_at < ? AND end_at > ?'),
     addBooking: db.prepare('INSERT INTO bookings (room_id, user_id, start_at, end_at) VALUES (?, ?, ?, ?)'),
     booking: db.prepare('SELECT user_id AS userId FROM bookings WHERE id = ?'),
@@ -234,6 +238,7 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
         return { id: Number(q.addBooking.run(rid, user.id, start, end).lastInsertRowid) };
       }
     }
+    if (method === 'GET' && path === '/api/bookings/mine') return q.myBookings.all(user.id, new Date().toISOString());
     const bookingId = Number(path.match(/^\/api\/bookings\/(\d+)$/)?.[1]);
     if (bookingId && method === 'DELETE') {
       const b = q.booking.get(bookingId) as { userId: number } | undefined;
