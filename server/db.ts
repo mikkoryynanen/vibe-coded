@@ -6,7 +6,7 @@ export function openDb(path: string) {
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL COLLATE NOCASE,
-      admin INTEGER NOT NULL DEFAULT 0);
+      admin INTEGER NOT NULL DEFAULT 0, oid TEXT);
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS rooms (
