@@ -55,7 +55,47 @@ const send = (res: ServerResponse, status: number, body?: unknown, headers: Reco
   else res.writeHead(status, { 'Content-Type': 'application/json', ...headers }).end(JSON.stringify(body));
 };
 
-const tools: Tool[] = [];
+const TIME = { type: 'string', format: 'date-time', description: 'ISO 8601 date-time, e.g. 2030-01-01T09:00:00Z (UTC if no offset)' };
+const ID = { type: 'integer', minimum: 1 };
+const NAME = { type: 'string', minLength: 1, maxLength: 50 };
+const schema = (properties: Record<string, unknown> = {}) => ({ type: 'object', properties, required: Object.keys(properties) });
+const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
+
+/** The user always comes from the validated token; arguments never choose it. */
+function toolsFor(service: Service): Tool[] {
+  return [
+    { name: 'list_rooms', description: 'List all rooms (id and name).', inputSchema: schema(), annotations: READ,
+      run: () => service.listRooms() },
+    { name: 'list_bookings', description: 'List bookings that overlap a time range, with room and user names.',
+      inputSchema: schema({ from: TIME, to: TIME }), annotations: READ,
+      run: (_user, a) => {
+        const rooms = new Map(service.listRooms().map((r) => [r.id, r.name]));
+        return (service.listBookings(a.from, a.to) as { roomId: number }[]).map((b) => ({ ...b, roomName: rooms.get(b.roomId) }));
+      } },
+    { name: 'my_bookings', description: 'List your ongoing and upcoming bookings, soonest first.', inputSchema: schema(), annotations: READ,
+      run: (user) => service.myBookings(user) },
+    { name: 'find_free_rooms', description: 'List rooms with no booking overlapping a time range.',
+      inputSchema: schema({ start: TIME, end: TIME }), annotations: READ,
+      run: (_user, a) => service.findFreeRooms(a.start, a.end) },
+    { name: 'book_room', description: 'Book a room for yourself. Fails if the room is already booked in that time; back-to-back bookings are fine.',
+      inputSchema: schema({ roomId: ID, start: TIME, end: TIME }), annotations: WRITE,
+      run: (user, a) => service.bookRoom(user, a.roomId, a.start, a.end) },
+    { name: 'cancel_booking', description: 'Cancel a booking. You can cancel your own bookings; admins can cancel any.',
+      inputSchema: schema({ bookingId: ID }), annotations: DESTRUCTIVE,
+      run: (user, a) => service.cancelBooking(user, a.bookingId) },
+    { name: 'create_room', description: 'Add a room (admins only).', admin: true,
+      inputSchema: schema({ name: NAME }), annotations: WRITE,
+      run: (user, a) => service.addRoom(user, a.name) },
+    { name: 'rename_room', description: 'Rename a room (admins only).', admin: true,
+      inputSchema: schema({ roomId: ID, name: NAME }), annotations: { ...WRITE, idempotentHint: true },
+      run: (user, a) => service.renameRoom(user, a.roomId, a.name) },
+    { name: 'delete_room', description: 'Delete a room and all its bookings (admins only).', admin: true,
+      inputSchema: schema({ roomId: ID }), annotations: DESTRUCTIVE,
+      run: (user, a) => service.deleteRoom(user, a.roomId) },
+  ];
+}
 
 /** MCP over Streamable HTTP (JSON responses only) at /mcp, authenticated by Entra access tokens. */
 export function createMcp(service: Service, cfg: McpConfig) {
@@ -63,6 +103,7 @@ export function createMcp(service: Service, cfg: McpConfig) {
   const scope = cfg.scope || `api://${cfg.clientId}/${MCP_SCOPE_NAME}`;
   const challenge = `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource", scope="${scope}"`;
   const verifyToken = createBearerAuth(cfg);
+  const tools = toolsFor(service);
 
   const metadata = () => ({
     resource: `${origin}/mcp`,

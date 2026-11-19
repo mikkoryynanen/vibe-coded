@@ -578,3 +578,149 @@ test('mcp: protocol versions, lifecycle and JSON-RPC errors', async (t) => {
   assert.equal(big.status, 413);
   assert.equal((await big.json()).error.code, -32600);
 });
+
+async function startTools(t: TestContext) {
+  const ctx = await startMcp(t);
+  const tokens = {
+    admin: await ctx.token({ oid: 'oid-admin', name: 'Admin', roles: ['Admin'] }),
+    alice: await ctx.token({ oid: 'oid-alice', name: 'alice' }),
+    bob: await ctx.token({ oid: 'oid-bob', name: 'bob' }),
+  };
+  type Who = keyof typeof tokens;
+  const rpc = async (who: Who, method: string, params: Claims = {}) => {
+    const res = await ctx.post(tokens[who], { jsonrpc: '2.0', id: 1, method, params }, LEGACY_HEADERS);
+    assert.equal(res.status, 200);
+    return (await res.json()).result;
+  };
+  /** Calls a tool; returns the parsed JSON on success or `{ error }` with the text of an isError result. */
+  const tool = async (who: Who, name: string, args: Claims = {}) => {
+    const result = await rpc(who, 'tools/call', { name, arguments: args });
+    const text = result.content[0].text as string;
+    return result.isError ? { error: text } : JSON.parse(text);
+  };
+  const count = (table: string) => Number(ctx.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n);
+  return { ...ctx, tokens, rpc, tool, count };
+}
+
+const at = (h: string, day = '2030-01-01') => `${day}T${h}:00.000Z`;
+
+test('mcp tools: list shows admin tools to admins only, with schemas and annotations', async (t) => {
+  const { rpc } = await startTools(t);
+  const userTools = ['list_rooms', 'list_bookings', 'my_bookings', 'find_free_rooms', 'book_room', 'cancel_booking'];
+  const adminTools = [...userTools, 'create_room', 'rename_room', 'delete_room'];
+  const asUser = (await rpc('alice', 'tools/list')).tools;
+  assert.deepEqual(asUser.map((x: { name: string }) => x.name), userTools);
+  const asAdmin = (await rpc('admin', 'tools/list')).tools;
+  assert.deepEqual(asAdmin.map((x: { name: string }) => x.name), adminTools);
+  const byName = Object.fromEntries(asAdmin.map((x: { name: string }) => [x.name, x]));
+  for (const name of ['list_rooms', 'list_bookings', 'my_bookings', 'find_free_rooms']) assert.equal(byName[name].annotations.readOnlyHint, true, name);
+  for (const name of ['cancel_booking', 'delete_room']) assert.equal(byName[name].annotations.destructiveHint, true, name);
+  for (const x of asAdmin) {
+    assert.equal(x.inputSchema.type, 'object', x.name);
+    assert.equal(typeof x.description, 'string');
+    assert.equal(x.run, undefined);
+    assert.equal(x.admin, undefined);
+  }
+  assert.deepEqual(byName.book_room.inputSchema.required, ['roomId', 'start', 'end']);
+});
+
+test('mcp tools: happy paths for all nine tools', async (t) => {
+  const { tool, userRow, post, tokens } = await startTools(t);
+  const desk = (await tool('admin', 'create_room', { name: 'Desk 1' })).id;
+  assert.ok(Number.isInteger(desk));
+  const lab = (await tool('admin', 'create_room', { name: 'Lab' })).id;
+  assert.deepEqual(await tool('admin', 'rename_room', { roomId: lab, name: 'Big Lab' }), { ok: true });
+  assert.deepEqual(await tool('alice', 'list_rooms'), [{ id: lab, name: 'Big Lab' }, { id: desk, name: 'Desk 1' }]);
+
+  const booked = await tool('alice', 'book_room', { roomId: desk, start: at('09:00'), end: at('10:00') });
+  assert.ok(Number.isInteger(booked.id));
+  const alice = userRow('oid-alice');
+  assert.deepEqual(await tool('bob', 'list_bookings', { from: at('00:00'), to: at('23:59') }), [
+    { id: booked.id, roomId: desk, roomName: 'Desk 1', userId: alice?.id, userName: 'alice', start: at('09:00'), end: at('10:00') },
+  ]);
+  assert.deepEqual(await tool('bob', 'find_free_rooms', { start: at('09:30'), end: at('11:00') }), [{ id: lab, name: 'Big Lab' }]);
+  assert.deepEqual(await tool('bob', 'find_free_rooms', { start: at('10:00'), end: at('11:00') }), [{ id: lab, name: 'Big Lab' }, { id: desk, name: 'Desk 1' }]);
+
+  const now = Date.now();
+  const iso = (ms: number) => new Date(now + ms).toISOString();
+  const h = 3600_000;
+  const past = await tool('alice', 'book_room', { roomId: lab, start: iso(-3 * h), end: iso(-2 * h) });
+  const ongoing = await tool('alice', 'book_room', { roomId: lab, start: iso(-h), end: iso(h) });
+  const later = await tool('alice', 'book_room', { roomId: lab, start: iso(48 * h), end: iso(49 * h) });
+  await tool('bob', 'book_room', { roomId: lab, start: iso(2 * h), end: iso(3 * h) });
+  const mine = await tool('alice', 'my_bookings');
+  assert.deepEqual(mine.map((b: { id: number }) => b.id), [ongoing.id, later.id, booked.id], 'own ongoing and upcoming only, soonest first');
+  assert.ok(!mine.some((b: { id: number }) => b.id === past.id));
+  assert.deepEqual(mine[0], { id: ongoing.id, roomId: lab, roomName: 'Big Lab', start: iso(-h), end: iso(h) });
+
+  assert.deepEqual(await tool('alice', 'cancel_booking', { bookingId: booked.id }), { ok: true });
+  assert.deepEqual(await tool('alice', 'list_bookings', { from: at('00:00'), to: at('23:59') }), []);
+  assert.deepEqual(await tool('admin', 'delete_room', { roomId: lab }), { ok: true });
+  assert.deepEqual(await tool('alice', 'my_bookings'), [], 'deleting a room removes its bookings');
+  assert.deepEqual(await tool('alice', 'list_rooms'), [{ id: desk, name: 'Desk 1' }]);
+
+  const name = `=?base64?${Buffer.from('list_rooms').toString('base64')}?=`;
+  const modern = modernRequest('tools/call', { name: 'list_rooms', arguments: {} });
+  const res = await post(tokens.bob, modern.body, { ...modern.headers, 'Mcp-Name': name });
+  assert.equal(res.status, 200, 'stateless 2026-07-28 call with a Base64-encoded Mcp-Name');
+  const result = (await res.json()).result;
+  assert.deepEqual(JSON.parse(result.content[0].text), [{ id: desk, name: 'Desk 1' }]);
+  assert.deepEqual(result._meta, { 'io.modelcontextprotocol/serverInfo': { name: 'desk-booking', version: '1.0.0' } });
+});
+
+test('mcp tools: admin and ownership checks run on every call', async (t) => {
+  const { db, tool, count } = await startTools(t);
+  const roomId = (await tool('admin', 'create_room', { name: 'Desk 1' })).id;
+  const rooms = () => db.prepare('SELECT id, name FROM rooms').all().map((r) => ({ ...r }));
+  const before = rooms();
+  for (const [name, args] of [['create_room', { name: 'Desk 2' }], ['rename_room', { roomId, name: 'Hacked' }], ['delete_room', { roomId }]] as const)
+    assert.deepEqual(await tool('alice', name, args), { error: 'Admins only' }, name);
+  assert.deepEqual(rooms(), before, 'hidden admin tools change nothing for non-admins');
+
+  const bobs = (await tool('bob', 'book_room', { roomId, start: at('09:00'), end: at('10:00') })).id;
+  assert.deepEqual(await tool('alice', 'cancel_booking', { bookingId: bobs }), { error: 'You can only cancel your own bookings' });
+  assert.equal(count('bookings'), 1, 'booking still exists');
+  assert.deepEqual(await tool('admin', 'cancel_booking', { bookingId: bobs }), { ok: true });
+  assert.equal(count('bookings'), 0, 'admin may cancel any booking');
+  assert.deepEqual(await tool('admin', 'cancel_booking', { bookingId: bobs }), { error: 'Booking not found' });
+});
+
+test('mcp tools: clashes and invalid input return the REST error messages', async (t) => {
+  const { db, tool, post, tokens, userRow } = await startTools(t);
+  const roomId = (await tool('admin', 'create_room', { name: 'Desk 1' })).id;
+  const book = (who: 'alice' | 'bob', start: string, end: string, extra: Claims = {}) => tool(who, 'book_room', { roomId, start: at(start), end: at(end), ...extra });
+
+  assert.ok((await book('alice', '09:00', '10:00')).id);
+  assert.deepEqual(await book('bob', '09:30', '10:30'), { error: 'That room is already booked in this time' });
+  assert.deepEqual(await book('bob', '08:00', '11:00'), { error: 'That room is already booked in this time' });
+  assert.ok((await book('bob', '10:00', '11:00')).id, 'back-to-back allowed');
+
+  const cases: [string, Claims, string][] = [
+    ['book_room', { roomId, start: 'tomorrow-ish', end: at('10:00') }, 'Start must be a valid date/time'],
+    ['book_room', { roomId, start: at('09:00') }, 'End must be a valid date/time'],
+    ['book_room', { roomId, start: at('12:00'), end: at('11:00') }, 'End must be after start'],
+    ['book_room', { roomId, start: at('12:00'), end: at('12:00') }, 'End must be after start'],
+    ['book_room', { roomId: 999, start: at('12:00'), end: at('13:00') }, 'Room not found'],
+    ['book_room', { roomId: 'abc', start: at('12:00'), end: at('13:00') }, 'Room not found'],
+    ['list_bookings', { from: 'x', to: at('10:00') }, 'from must be a valid date/time'],
+    ['find_free_rooms', { start: at('12:00'), end: at('11:00') }, 'End must be after start'],
+    ['cancel_booking', { bookingId: 999 }, 'Booking not found'],
+    ['create_room', { name: 'x'.repeat(51) }, 'Room name must be 1-50 characters'],
+    ['create_room', { name: '   ' }, 'Room name must be 1-50 characters'],
+    ['create_room', { name: 'desk 1' }, 'That name is already taken'],
+    ['rename_room', { roomId: 999, name: 'Other' }, 'Room not found'],
+    ['delete_room', { roomId: 999 }, 'Room not found'],
+  ];
+  for (const [name, args, error] of cases)
+    assert.deepEqual(await tool(name.endsWith('room') && name !== 'book_room' ? 'admin' : 'alice', name, args), { error }, `${name} ${JSON.stringify(args)}`);
+
+  const bob = userRow('oid-bob');
+  const alice = userRow('oid-alice');
+  const spoof = await book('alice', '14:00', '15:00', { userId: bob?.id });
+  assert.equal(db.prepare('SELECT user_id AS u FROM bookings WHERE id = ?').get(spoof.id)?.u, alice?.id, 'userId argument ignored');
+
+  for (const params of [{ name: 'drop_tables', arguments: {} }, { name: 'list_rooms', arguments: [] }, { arguments: {} }]) {
+    const res = await post(tokens.alice, { jsonrpc: '2.0', id: 1, method: 'tools/call', params }, LEGACY_HEADERS);
+    assert.equal((await res.json()).error.code, -32602, JSON.stringify(params));
+  }
+});
