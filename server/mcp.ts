@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createBearerAuth, MCP_SCOPE_NAME } from './bearer.ts';
+import { createBearerAuth, createRateLimiter, MCP_SCOPE_NAME } from './bearer.ts';
 import { type ActingUser, type Body, HttpError, readJson, type Service } from './service.ts';
 
 type McpConfig = {
@@ -104,6 +104,7 @@ export function createMcp(service: Service, cfg: McpConfig) {
   const challenge = `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource", scope="${scope}"`;
   const verifyToken = createBearerAuth(cfg);
   const tools = toolsFor(service);
+  const rateLimit = createRateLimiter(60, 60_000);
 
   const metadata = () => ({
     resource: `${origin}/mcp`,
@@ -183,6 +184,8 @@ export function createMcp(service: Service, cfg: McpConfig) {
     if (method !== 'POST') return send(res, 405, { error: 'Method not allowed' }, { Allow: 'POST' });
     const user = await authenticate(req);
     if (!user) return send(res, 401, { error: 'Unauthorized' }, { 'WWW-Authenticate': challenge });
+    const retryAfter = rateLimit(user.id);
+    if (retryAfter) return send(res, 429, { error: 'Too many requests' }, { 'Retry-After': String(retryAfter) });
 
     let id: unknown = null;
     let modern = false;

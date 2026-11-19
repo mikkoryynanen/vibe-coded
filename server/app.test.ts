@@ -724,3 +724,18 @@ test('mcp tools: clashes and invalid input return the REST error messages', asyn
     assert.equal((await res.json()).error.code, -32602, JSON.stringify(params));
   }
 });
+
+test('mcp: more than 60 requests a minute per user get 429 with Retry-After', async (t) => {
+  const { post, token } = await startMcp(t);
+  const alice = await token({ oid: 'oid-alice', name: 'alice' });
+  const ping = { jsonrpc: '2.0', id: 1, method: 'ping' };
+  for (let i = 0; i < 60; i++) assert.equal((await post(alice, ping, LEGACY_HEADERS)).status, 200, `request ${i + 1}`);
+  const limited = await post(alice, ping, LEGACY_HEADERS);
+  assert.equal(limited.status, 429);
+  const retry = Number(limited.headers.get('retry-after'));
+  assert.ok(retry >= 1 && retry <= 60, String(retry));
+  assert.deepEqual(await limited.json(), { error: 'Too many requests' });
+  const freshToken = await token({ oid: 'oid-alice', name: 'alice' });
+  assert.equal((await post(freshToken, ping, LEGACY_HEADERS)).status, 429, 'keyed by user, not by token');
+  assert.equal((await post(await token({ oid: 'oid-bob', name: 'bob' }), ping, LEGACY_HEADERS)).status, 200, 'other users unaffected');
+});

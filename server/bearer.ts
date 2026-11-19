@@ -71,3 +71,19 @@ export function createBearerAuth(cfg: BearerConfig) {
     return claims;
   };
 }
+
+/** Fixed window per key. `hit` returns 0 when allowed, else the seconds until the window resets. */
+export function createRateLimiter(limit: number, windowMs: number) {
+  const windows = new Map<string | number, { start: number; count: number }>();
+  return function hit(key: string | number) {
+    const now = Date.now();
+    if (windows.size > 10_000) for (const [k, w] of windows) if (now - w.start >= windowMs) windows.delete(k);
+    let w = windows.get(key);
+    if (!w || now - w.start >= windowMs) {
+      w = { start: now, count: 0 };
+      windows.set(key, w);
+    }
+    w.count++;
+    return w.count > limit ? Math.max(1, Math.ceil((w.start + windowMs - now) / 1000)) : 0;
+  };
+}
