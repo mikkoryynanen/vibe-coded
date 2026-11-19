@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes } from 'node:crypto';
 import { OAuth2Issuer, OAuth2Server } from 'oauth2-mock-server';
-import { openDb } from './db.ts';
+import { ensureRoom, openDb } from './db.ts';
 import { createHandler, oidcConfigFromEnv } from './app.ts';
 
 const usersCount = (db: DatabaseSync) => Number(db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n);
@@ -17,7 +17,7 @@ const cookieValue = (res: Response, name: string) => setCookie(res, name)?.match
 
 type Tamper = (cb: URL, flow: string) => string | null | Promise<string | null>;
 
-async function startOidc(t: TestContext, opts: { mcpScope?: string } = {}) {
+async function startOidc(t: TestContext, opts: { mcpScope?: string; mcpEnabled?: boolean } = {}) {
   const mock = new OAuth2Server();
   await mock.issuer.keys.generate('RS256');
   await mock.start(0, 'localhost');
@@ -376,8 +376,8 @@ function accessToken(issuer: OAuth2Issuer, claims: Claims = {}, kid?: string) {
   });
 }
 
-async function startMcp(t: TestContext, opts: { mcpScope?: string } = {}) {
-  const ctx = await startOidc(t, opts);
+async function startMcp(t: TestContext, opts: { mcpScope?: string; mcpEnabled?: boolean } = {}) {
+  const ctx = await startOidc(t, { mcpEnabled: true, ...opts });
   const post = (token: string | undefined, body: unknown, headers: Record<string, string> = {}) =>
     fetch(`${ctx.origin}/mcp`, {
       method: 'POST',
@@ -944,4 +944,40 @@ test('mcp: more than 30 failed bearer authentications a minute per IP get 429', 
   assert.equal(limited.headers.get('www-authenticate'), null);
   assert.equal((await post(valid, ping, LEGACY_HEADERS)).status, 429, 'the IP is blocked for the rest of the window');
   assert.equal((await fetch(`${origin}/.well-known/oauth-protected-resource`)).status, 200, 'metadata still served');
+});
+
+test('mcp: its routes are 404 unless enabled and called from loopback', async (t) => {
+  const routes = [['POST', '/mcp'], ['GET', '/.well-known/oauth-protected-resource'], ['GET', '/.well-known/oauth-authorization-server'], ['GET', '/oauth/authorize'], ['POST', '/oauth/token']];
+  const off = await startMcp(t, { mcpEnabled: false });
+  const offToken = await off.token();
+  for (const [method, path] of routes) {
+    const res = await fetch(off.origin + path, { method, headers: { Authorization: `Bearer ${offToken}` } });
+    assert.equal(res.status, 404, `${method} ${path} when disabled`);
+  }
+  assert.equal(usersCount(off.db), 0, 'a valid token creates no user when disabled');
+  assert.equal((await off.call('GET', '/rooms')).status, 401, 'REST routes are unaffected');
+
+  const on = await startMcp(t);
+  assert.equal((await on.post(undefined, {})).status, 401, 'enabled on loopback reaches bearer auth');
+  const lan = Object.values(networkInterfaces()).flat().find((a) => a?.family === 'IPv4' && !a.internal);
+  if (!lan) return t.skip('no non-loopback interface');
+  const remote = `http://${lan.address}:${new URL(on.origin).port}`;
+  const onToken = await on.token();
+  for (const [method, path] of routes) {
+    const res = await fetch(remote + path, { method, headers: { Authorization: `Bearer ${onToken}` } });
+    assert.equal(res.status, 404, `${method} ${path} from ${lan.address}`);
+  }
+  assert.equal(usersCount(on.db), 0, 'a valid token from a non-loopback address creates no user');
+});
+
+test('ensureRoom adds the room only when there are no rooms', () => {
+  const db = openDb(':memory:');
+  const names = () => db.prepare('SELECT name FROM rooms ORDER BY id').all().map((r) => r.name);
+  ensureRoom(db, 'Test room');
+  ensureRoom(db, 'Test room');
+  assert.deepEqual(names(), ['Test room']);
+  db.prepare('DELETE FROM rooms').run();
+  db.prepare('INSERT INTO rooms (name) VALUES (?)').run('Desk 1');
+  ensureRoom(db, 'Test room');
+  assert.deepEqual(names(), ['Desk 1']);
 });
