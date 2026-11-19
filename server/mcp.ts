@@ -105,10 +105,11 @@ export function createMcp(service: Service, cfg: McpConfig) {
   const verifyToken = createBearerAuth(cfg);
   const tools = toolsFor(service);
   const rateLimit = createRateLimiter(60, 60_000);
+  const failedAuthLimit = createRateLimiter(30, 60_000);
 
   const metadata = () => ({
     resource: `${origin}/mcp`,
-    authorization_servers: [cfg.issuer],
+    authorization_servers: [origin],
     scopes_supported: [scope],
     bearer_methods_supported: ['header'],
   });
@@ -182,8 +183,15 @@ export function createMcp(service: Service, cfg: McpConfig) {
 
   async function handle(req: IncomingMessage, res: ServerResponse, method: string) {
     if (method !== 'POST') return send(res, 405, { error: 'Method not allowed' }, { Allow: 'POST' });
+    const ip = req.socket.remoteAddress ?? '';
+    const blocked = failedAuthLimit(ip, 0);
+    if (blocked) return send(res, 429, { error: 'Too many requests' }, { 'Retry-After': String(blocked) });
     const user = await authenticate(req);
-    if (!user) return send(res, 401, { error: 'Unauthorized' }, { 'WWW-Authenticate': challenge });
+    if (!user) {
+      const retry = failedAuthLimit(ip);
+      if (retry) return send(res, 429, { error: 'Too many requests' }, { 'Retry-After': String(retry) });
+      return send(res, 401, { error: 'Unauthorized' }, { 'WWW-Authenticate': challenge });
+    }
     const retryAfter = rateLimit(user.id);
     if (retryAfter) return send(res, 429, { error: 'Too many requests' }, { 'Retry-After': String(retryAfter) });
 
@@ -219,5 +227,5 @@ export function createMcp(service: Service, cfg: McpConfig) {
     }
   }
 
-  return { metadata, handle };
+  return { metadata, handle, scope };
 }

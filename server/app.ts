@@ -3,6 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import * as client from 'openid-client';
 import { createMcp } from './mcp.ts';
+import { createOAuthProxy } from './oauth.ts';
 import { createService, HttpError, readJson, requireAdmin } from './service.ts';
 
 type User = { id: number; name: string; admin: number };
@@ -59,6 +60,15 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig, opts: { mcpSco
   };
 
   const mcp = createMcp(service, { ...oidc, scope: opts.mcpScope, jwksUri: async () => (await oidcClient()).serverMetadata().jwks_uri });
+  const oauth = createOAuthProxy({
+    clientId: oidc.clientId,
+    origin: new URL(oidc.redirectUri).origin,
+    scope: mcp.scope,
+    endpoints: async () => {
+      const meta = (await oidcClient()).serverMetadata();
+      return { authorize: meta.authorization_endpoint, token: meta.token_endpoint };
+    },
+  });
 
   async function signIn(url: URL, flow: string) {
     const [verifier, state, nonce] = flow.split('.');
@@ -74,6 +84,10 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig, opts: { mcpSco
     // MCP uses bearer tokens only (never the session cookie) and authenticates before reading the body.
     if (path === '/mcp') return mcp.handle(req, res, method);
     if (method === 'GET' && path === '/.well-known/oauth-protected-resource') return mcp.metadata();
+    // Public OAuth proxy for MCP clients: stateless, relays to Entra, never creates a session.
+    if (method === 'GET' && path === '/.well-known/oauth-authorization-server') return oauth.metadata();
+    if (method === 'GET' && path === '/oauth/authorize') return oauth.authorize(res, url);
+    if (method === 'POST' && path === '/oauth/token') return oauth.token(req, res);
 
     const body = method === 'POST' || method === 'PATCH' ? await readJson(req) : {};
 

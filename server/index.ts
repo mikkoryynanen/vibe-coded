@@ -16,8 +16,9 @@ const db = openDb(process.env.DB_PATH ?? 'booking.db');
 const api = createHandler(db, oidc, { mcpScope: process.env.MCP_SCOPE?.trim() || undefined });
 const port = Number(process.env.PORT ?? 3000);
 
-// One server: /api, /mcp and its OAuth metadata go to the API, everything else to Vite (UI with hot reload).
-const toApi = (url = '') => url.startsWith('/api') || /^\/(mcp|\.well-known\/oauth-protected-resource)(\?|$)/.test(url);
+// One server: /api, /mcp, its OAuth metadata and the OAuth proxy go to the API, everything else to Vite (UI with hot reload).
+const toApi = (url = '') =>
+  url.startsWith('/api') || /^\/(mcp|oauth\/(authorize|token)|\.well-known\/oauth-(protected-resource|authorization-server))(\?|$)/.test(url);
 const server = createServer((req, res) => (toApi(req.url) ? api(req, res) : vite.middlewares(req, res)));
 const vite = await createVite({ server: { middlewareMode: true, hmr: { server } }, appType: 'spa' });
 server.listen(port, () => console.log(`App on http://localhost:${port}`));

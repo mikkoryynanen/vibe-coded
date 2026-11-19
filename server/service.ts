@@ -12,7 +12,7 @@ export class HttpError extends Error {
   }
 }
 
-export async function readJson(req: IncomingMessage): Promise<Body> {
+export async function readBody(req: IncomingMessage) {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
@@ -20,10 +20,15 @@ export async function readJson(req: IncomingMessage): Promise<Body> {
     if (size > 100_000) throw new HttpError(413, 'Request too large');
     chunks.push(chunk);
   }
-  if (!chunks.length) return {};
+  return Buffer.concat(chunks).toString();
+}
+
+export async function readJson(req: IncomingMessage): Promise<Body> {
+  const raw = await readBody(req);
+  if (!raw) return {};
   let body: unknown;
   try {
-    body = JSON.parse(Buffer.concat(chunks).toString());
+    body = JSON.parse(raw);
   } catch {
     throw new HttpError(400, 'Invalid JSON');
   }

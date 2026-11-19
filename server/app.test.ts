@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash, randomBytes } from 'node:crypto';
 import { OAuth2Issuer, OAuth2Server } from 'oauth2-mock-server';
 import { openDb } from './db.ts';
 import { createHandler, oidcConfigFromEnv } from './app.ts';
@@ -455,12 +456,12 @@ test('mcp: signing keys are cached and refetched at most once a minute', async (
 });
 
 test('mcp: protected resource metadata is public', async (t) => {
-  const { mock, origin } = await startMcp(t);
+  const { origin } = await startMcp(t);
   const res = await fetch(`${origin}/.well-known/oauth-protected-resource`);
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), {
     resource: `${origin}/mcp`,
-    authorization_servers: [mock.issuer.url],
+    authorization_servers: [origin],
     scopes_supported: ['api://test-client/Bookings.ReadWrite'],
     bearer_methods_supported: ['header'],
   });
@@ -753,4 +754,194 @@ test('mcp: more than 60 requests a minute per user get 429 with Retry-After', as
   const freshToken = await token({ oid: 'oid-alice', name: 'alice' });
   assert.equal((await post(freshToken, ping, LEGACY_HEADERS)).status, 429, 'keyed by user, not by token');
   assert.equal((await post(await token({ oid: 'oid-bob', name: 'bob' }), ping, LEGACY_HEADERS)).status, 200, 'other users unaffected');
+});
+
+async function startOAuth(t: TestContext) {
+  const ctx = await startMcp(t);
+  const relayed: { body: Record<string, unknown>; authorization?: string }[] = [];
+  let upstreamReply: { statusCode: number; body: Record<string, unknown> } | undefined;
+  ctx.mock.service.on('beforeResponse', (reply, req) => {
+    relayed.push({ body: { ...req.body }, authorization: req.headers.authorization });
+    if (upstreamReply) Object.assign(reply, upstreamReply);
+  });
+  const verifier = 'v'.repeat(43) + randomBytes(16).toString('base64url');
+  const redirectUri = 'http://localhost:33418/callback';
+  const authorizeParams = {
+    response_type: 'code',
+    client_id: 'test-client',
+    redirect_uri: redirectUri,
+    code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+    code_challenge_method: 'S256',
+    state: 'state-123',
+    scope: 'api://test-client/Bookings.ReadWrite',
+    resource: `${ctx.origin}/mcp`,
+  };
+  const authorize = (params: Record<string, string | undefined> | string) => {
+    const query = typeof params === 'string' ? params : new URLSearchParams(Object.entries(params).filter((e): e is [string, string] => e[1] !== undefined));
+    return fetch(`${ctx.origin}/oauth/authorize?${query}`, { redirect: 'manual' });
+  };
+  const tokenRequest = (body: Record<string, string> | string, contentType = 'application/x-www-form-urlencoded') =>
+    fetch(`${ctx.origin}/oauth/token`, { method: 'POST', headers: { 'Content-Type': contentType }, body: typeof body === 'string' ? body : new URLSearchParams(body).toString() });
+  const setUpstreamReply = (reply: typeof upstreamReply) => { upstreamReply = reply; };
+  return { ...ctx, relayed, verifier, redirectUri, authorizeParams, authorize, tokenRequest, setUpstreamReply };
+}
+
+test('oauth: authorization server metadata is public and points at the proxy', async (t) => {
+  const { origin } = await startOAuth(t);
+  const res = await fetch(`${origin}/.well-known/oauth-authorization-server`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    issuer: origin,
+    authorization_endpoint: `${origin}/oauth/authorize`,
+    token_endpoint: `${origin}/oauth/token`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none'],
+    scopes_supported: ['api://test-client/Bookings.ReadWrite', 'offline_access'],
+  });
+  assert.equal((await fetch(`${origin}/.well-known/oauth-authorization-server`, { method: 'POST' })).status, 401, 'only GET is public');
+  assert.equal((await fetch(`${origin}/oauth/authorize`, { method: 'POST' })).status, 401, 'authorize is GET only');
+  assert.equal((await fetch(`${origin}/oauth/token`)).status, 401, 'token is POST only');
+});
+
+test('oauth: authorize and token relay to Entra without resource or client secret, and log no tokens', async (t) => {
+  const { mock, db, relayed, verifier, redirectUri, authorizeParams, authorize, tokenRequest, setUpstreamReply } = await startOAuth(t);
+  const logged: unknown[][] = [];
+  for (const name of ['log', 'error', 'warn', 'info'] as const) t.mock.method(console, name, (...args: unknown[]) => { logged.push(args); });
+  const users = usersCount(db);
+
+  const res = await authorize(authorizeParams);
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get('set-cookie'), null, 'no cookie, stateless');
+  const target = new URL(res.headers.get('location') ?? '');
+  assert.equal(`${target.origin}${target.pathname}`, `${mock.issuer.url}/authorize`);
+  assert.deepEqual(Object.fromEntries(target.searchParams), {
+    response_type: 'code',
+    client_id: 'test-client',
+    redirect_uri: redirectUri,
+    scope: 'api://test-client/Bookings.ReadWrite offline_access',
+    state: 'state-123',
+    code_challenge: authorizeParams.code_challenge,
+    code_challenge_method: 'S256',
+  });
+  const withOffline = new URL((await authorize({ ...authorizeParams, scope: 'offline_access api://test-client/Bookings.ReadWrite' })).headers.get('location') ?? '');
+  assert.equal(withOffline.searchParams.get('scope'), 'offline_access api://test-client/Bookings.ReadWrite', 'offline_access not doubled');
+  const noScope = new URL((await authorize({ ...authorizeParams, scope: undefined })).headers.get('location') ?? '');
+  assert.equal(noScope.searchParams.get('scope'), 'api://test-client/Bookings.ReadWrite offline_access');
+  for (const host of ['127.0.0.1', '[::1]']) {
+    assert.equal((await authorize({ ...authorizeParams, redirect_uri: `http://${host}:4000/cb` })).status, 302, host);
+  }
+
+  const back = new URL((await fetch(target, { redirect: 'manual' })).headers.get('location') ?? '');
+  assert.equal(`${back.origin}${back.pathname}`, redirectUri);
+  assert.equal(back.searchParams.get('state'), 'state-123');
+  const code = back.searchParams.get('code') ?? '';
+
+  const tokenRes = await tokenRequest({
+    grant_type: 'authorization_code', client_id: 'test-client', code, redirect_uri: redirectUri, code_verifier: verifier,
+    resource: 'https://evil.example/mcp', client_secret: 'from-client', extra: 'x',
+  });
+  assert.equal(tokenRes.status, 200);
+  assert.equal(tokenRes.headers.get('cache-control'), 'no-store');
+  assert.equal(tokenRes.headers.get('set-cookie'), null);
+  const tokens = await tokenRes.json();
+  assert.equal(typeof tokens.access_token, 'string');
+  assert.equal(typeof tokens.refresh_token, 'string');
+  assert.equal(relayed.length, 1);
+  assert.deepEqual(relayed[0].body, { grant_type: 'authorization_code', client_id: 'test-client', code, redirect_uri: redirectUri, code_verifier: verifier });
+  assert.equal(relayed[0].authorization, undefined, 'no client authentication added');
+
+  const refreshed = await tokenRequest({ grant_type: 'refresh_token', client_id: 'test-client', refresh_token: tokens.refresh_token, resource: 'x', code: 'stray' });
+  assert.equal(refreshed.status, 200);
+  assert.equal(typeof (await refreshed.json()).access_token, 'string');
+  assert.deepEqual(relayed[1].body, { grant_type: 'refresh_token', client_id: 'test-client', refresh_token: tokens.refresh_token });
+
+  setUpstreamReply({ statusCode: 400, body: { error: 'invalid_grant', error_description: 'AADSTS70008: expired' } });
+  const failed = await tokenRequest({ grant_type: 'refresh_token', client_id: 'test-client', refresh_token: 'old' });
+  assert.equal(failed.status, 400, 'upstream status relayed');
+  assert.deepEqual(await failed.json(), { error: 'invalid_grant', error_description: 'AADSTS70008: expired' });
+
+  for (const r of relayed) assert.ok(!JSON.stringify(r).includes('test-secret'), 'server client secret never relayed');
+  const log = JSON.stringify(logged);
+  for (const secret of [tokens.access_token, tokens.refresh_token, code, verifier, 'test-secret']) assert.ok(!log.includes(secret), 'nothing secret logged');
+  assert.equal(usersCount(db), users, 'the proxy creates no users');
+});
+
+test('oauth: authorize rejects bad client, redirect and PKCE without redirecting', async (t) => {
+  const { authorizeParams: p, authorize } = await startOAuth(t);
+  const cases: [string, Record<string, string | undefined> | string][] = [
+    ['wrong client_id', { ...p, client_id: 'other-client' }],
+    ['missing client_id', { ...p, client_id: undefined }],
+    ['repeated client_id', `${new URLSearchParams(p as Record<string, string>)}&client_id=other-client`],
+    ['https redirect', { ...p, redirect_uri: 'https://evil.example/callback' }],
+    ['http non-loopback redirect', { ...p, redirect_uri: 'http://evil.example/callback' }],
+    ['look-alike host', { ...p, redirect_uri: 'http://localhost.evil.example/callback' }],
+    ['userinfo in redirect', { ...p, redirect_uri: 'http://user@localhost:1234/callback' }],
+    ['custom scheme', { ...p, redirect_uri: 'myapp://callback' }],
+    ['missing redirect', { ...p, redirect_uri: undefined }],
+    ['missing code_challenge', { ...p, code_challenge: undefined }],
+    ['short code_challenge', { ...p, code_challenge: 'abc' }],
+    ['plain method', { ...p, code_challenge_method: 'plain' }],
+    ['missing method', { ...p, code_challenge_method: undefined }],
+    ['implicit flow', { ...p, response_type: 'token' }],
+  ];
+  for (const [name, params] of cases) {
+    const res = await authorize(params);
+    assert.equal(res.status, 400, name);
+    assert.equal(res.headers.get('location'), null, name);
+    assert.equal(typeof (await res.json()).error, 'string', name);
+  }
+});
+
+test('oauth: token rejects bad requests before relaying', async (t) => {
+  const { relayed, verifier, redirectUri, tokenRequest } = await startOAuth(t);
+  const code = { grant_type: 'authorization_code', client_id: 'test-client', code: 'c', redirect_uri: redirectUri, code_verifier: verifier };
+  const cases: [string, number, string, () => Promise<Response>][] = [
+    ['JSON body', 400, 'invalid_request', () => tokenRequest(JSON.stringify(code), 'application/json')],
+    ['missing grant_type', 400, 'invalid_request', () => tokenRequest({ ...code, grant_type: '' })],
+    ['password grant', 400, 'unsupported_grant_type', () => tokenRequest({ ...code, grant_type: 'password' })],
+    ['client_credentials grant', 400, 'unsupported_grant_type', () => tokenRequest({ ...code, grant_type: 'client_credentials' })],
+    ['wrong client_id', 401, 'invalid_client', () => tokenRequest({ ...code, client_id: 'other-client' })],
+    ['missing client_id', 401, 'invalid_client', () => tokenRequest({ ...code, client_id: '' })],
+    ['repeated client_id', 400, 'invalid_request', () => tokenRequest(`${new URLSearchParams(code)}&client_id=other-client`)],
+    ['missing code', 400, 'invalid_request', () => tokenRequest({ ...code, code: '' })],
+    ['non-loopback redirect', 400, 'invalid_request', () => tokenRequest({ ...code, redirect_uri: 'https://evil.example/cb' })],
+    ['missing code_verifier', 400, 'invalid_request', () => tokenRequest({ ...code, code_verifier: '' })],
+    ['short code_verifier', 400, 'invalid_request', () => tokenRequest({ ...code, code_verifier: 'short' })],
+    ['missing refresh_token', 400, 'invalid_request', () => tokenRequest({ grant_type: 'refresh_token', client_id: 'test-client' })],
+    ['body over 100 KB', 413, 'invalid_request', () => tokenRequest({ ...code, scope: 'x'.repeat(110_000) })],
+  ];
+  for (const [name, status, error, run] of cases) {
+    const res = await run();
+    assert.equal(res.status, status, name);
+    assert.equal((await res.json()).error, error, name);
+  }
+  assert.equal(relayed.length, 0, 'nothing reached the token endpoint');
+});
+
+test('oauth: more than 30 token requests a minute per IP get 429 with Retry-After', async (t) => {
+  const { relayed, tokenRequest } = await startOAuth(t);
+  for (let i = 0; i < 30; i++) assert.equal((await tokenRequest({ grant_type: 'password' })).status, 400, `request ${i + 1}`);
+  const limited = await tokenRequest({ grant_type: 'refresh_token', client_id: 'test-client', refresh_token: 'r' });
+  assert.equal(limited.status, 429);
+  const retry = Number(limited.headers.get('retry-after'));
+  assert.ok(retry >= 1 && retry <= 60, String(retry));
+  assert.equal((await limited.json()).error, 'slow_down');
+  assert.equal(relayed.length, 0);
+});
+
+test('mcp: more than 30 failed bearer authentications a minute per IP get 429', async (t) => {
+  const { post, token, origin } = await startMcp(t);
+  const ping = { jsonrpc: '2.0', id: 1, method: 'ping' };
+  const valid = await token();
+  assert.equal((await post(valid, ping, LEGACY_HEADERS)).status, 200, 'successes are not counted');
+  for (let i = 0; i < 30; i++) assert.equal((await post('not-a-jwt', ping, LEGACY_HEADERS)).status, 401, `failure ${i + 1}`);
+  const limited = await post(undefined, ping, LEGACY_HEADERS);
+  assert.equal(limited.status, 429);
+  const retry = Number(limited.headers.get('retry-after'));
+  assert.ok(retry >= 1 && retry <= 60, String(retry));
+  assert.equal(limited.headers.get('www-authenticate'), null);
+  assert.equal((await post(valid, ping, LEGACY_HEADERS)).status, 429, 'the IP is blocked for the rest of the window');
+  assert.equal((await fetch(`${origin}/.well-known/oauth-protected-resource`)).status, 200, 'metadata still served');
 });

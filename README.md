@@ -79,7 +79,13 @@ OIDC_ISSUER=http://localhost:8090 OIDC_CLIENT_ID=mock-client OIDC_CLIENT_SECRET=
 
 MCP clients (Claude Code, Claude Desktop, other agents) can use the app at `/mcp` as the signed-in Microsoft user, with exactly that user's permissions in the web UI. The server speaks MCP over Streamable HTTP (JSON responses, no SSE, no sessions): protocol `2026-07-28` statelessly, and `2025-11-25` / `2025-06-18` clients through `initialize`.
 
-Entra ID is the authorization server; this app only validates its access tokens. Clients find it through `GET /.well-known/oauth-protected-resource`. A token is accepted only if it is signed by the issuer's keys, `iss` is `OIDC_ISSUER`, `aud` is `OIDC_CLIENT_ID`, `scp` contains `Bookings.ReadWrite`, it has not expired, and it was issued **at most 15 minutes ago**. The 15-minute rule makes clients refresh their token, which re-reads the `Admin` role and fails for disabled users, so the revocation gap stays the same as for web sessions. Each user may make 60 requests per minute; more get `429` with `Retry-After`.
+Entra ID issues the tokens; this app validates them. Clients find the authorization server through `GET /.well-known/oauth-protected-resource`, which points at this app's own origin. The app runs a small stateless OAuth proxy there, because MCP clients send the RFC 8707 `resource` parameter and Entra v2 rejects it (`AADSTS9010010`):
+
+- `GET /.well-known/oauth-authorization-server`: RFC 8414 metadata (PKCE `S256`, public client, `authorization_code` and `refresh_token`).
+- `GET /oauth/authorize`: requires `client_id` = `OIDC_CLIENT_ID`, a loopback `redirect_uri` (`http://localhost`, `127.0.0.1` or `[::1]`, any port), `response_type=code` and an `S256` code challenge. It adds `offline_access` to the scope so Entra returns a refresh token, drops every other parameter (including `resource`) and redirects to Entra's authorize endpoint.
+- `POST /oauth/token`: form body (100 KB cap), `grant_type` `authorization_code` or `refresh_token`, `client_id` = `OIDC_CLIENT_ID`. It relays only the allow-listed fields to Entra's token endpoint and returns Entra's answer. It never adds the client secret, so the MCP client is a public client. 30 requests per minute per IP; more get `429`.
+
+The proxy keeps no state and logs no codes or tokens. Users still sign in only at Microsoft. A token is accepted only if it is signed by the issuer's keys, `iss` is `OIDC_ISSUER`, `aud` is `OIDC_CLIENT_ID`, `scp` contains `Bookings.ReadWrite`, it has not expired, and it was issued **at most 15 minutes ago**. The 15-minute rule makes clients refresh their token, which re-reads the `Admin` role and fails for disabled users, so the revocation gap stays the same as for web sessions. Each user may make 60 requests per minute; more get `429` with `Retry-After`. After more than 30 failed authentications in a minute, an IP gets `429` for the rest of that minute.
 
 Tools:
 
@@ -101,7 +107,7 @@ One-time Entra setup on the existing app registration (done by a person):
 
 1. **Manifest**: set `requestedAccessTokenVersion` to `2`.
 2. **Expose an API**: set the Application ID URI to `api://<client-id>` and add the delegated scope `Bookings.ReadWrite`.
-3. **Authentication**: add a platform for the MCP client's redirect URI (Claude Code: `http://localhost:<port>/callback`), and allow public client flows if the client uses PKCE without a secret.
+3. **Authentication**: add a **Mobile and desktop applications** platform with the MCP client's redirect URI (Claude Code: `http://localhost:<port>/callback`), and allow public client flows: the proxy relays no client secret.
 4. **API permissions**: add the app's own `Bookings.ReadWrite` permission and grant admin consent.
 
 Entra supports neither Dynamic Client Registration nor Client ID Metadata Documents, so clients use the app's pre-registered client id. Claude Code:

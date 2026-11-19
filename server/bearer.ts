@@ -10,6 +10,12 @@ type BearerConfig = { issuer: string; clientId: string; jwksUri: () => Promise<s
 const part = (s: string) => JSON.parse(Buffer.from(s, 'base64url').toString()) as unknown;
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** Entra endpoints are always https; plain http only for a local mock provider. */
+export function httpsOrLocal(uri: string) {
+  const { protocol, hostname } = new URL(uri);
+  return protocol === 'https:' || (protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1'));
+}
+
 /** Validates Entra v2 access tokens for /mcp. Throws an Error whose message is the reason (for the server log only). */
 export function createBearerAuth(cfg: BearerConfig) {
   const jwks = { keys: new Map<string, KeyObject>(), fetchedAt: 0 };
@@ -18,9 +24,7 @@ export function createBearerAuth(cfg: BearerConfig) {
   async function fetchKeys() {
     const uri = await cfg.jwksUri();
     if (!uri) throw new Error('Issuer metadata has no jwks_uri');
-    const { protocol, hostname } = new URL(uri);
-    if (protocol !== 'https:' && !(protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1')))
-      throw new Error('jwks_uri must be https');
+    if (!httpsOrLocal(uri)) throw new Error('jwks_uri must be https');
     jwks.fetchedAt = Date.now();
     const res = await fetch(uri, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`JWKS fetch failed with ${res.status}`);
@@ -72,18 +76,19 @@ export function createBearerAuth(cfg: BearerConfig) {
   };
 }
 
-/** Fixed window per key. `hit` returns 0 when allowed, else the seconds until the window resets. */
+/** Fixed window per key. `hit` returns 0 when allowed, else the seconds until the window resets. `cost` 0 only checks. */
 export function createRateLimiter(limit: number, windowMs: number) {
   const windows = new Map<string | number, { start: number; count: number }>();
-  return function hit(key: string | number) {
+  return function hit(key: string | number, cost = 1) {
     const now = Date.now();
     if (windows.size > 10_000) for (const [k, w] of windows) if (now - w.start >= windowMs) windows.delete(k);
     let w = windows.get(key);
     if (!w || now - w.start >= windowMs) {
+      if (!cost) return 0;
       w = { start: now, count: 0 };
       windows.set(key, w);
     }
-    w.count++;
+    w.count += cost;
     return w.count > limit ? Math.max(1, Math.ceil((w.start + windowMs - now) / 1000)) : 0;
   };
 }
