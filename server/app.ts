@@ -2,50 +2,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import * as client from 'openid-client';
+import { createService, HttpError, readJson, requireAdmin } from './service.ts';
 
 type User = { id: number; name: string; admin: number };
 export type OidcConfig = { issuer: string; clientId: string; clientSecret: string; redirectUri: string };
-type Body = Record<string, unknown>;
-
-class HttpError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-async function readJson(req: IncomingMessage): Promise<Body> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > 100_000) throw new HttpError(413, 'Request too large');
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-  let body: unknown;
-  try {
-    body = JSON.parse(Buffer.concat(chunks).toString());
-  } catch {
-    throw new HttpError(400, 'Invalid JSON');
-  }
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new HttpError(400, 'Expected a JSON object');
-  return body as Body;
-}
-
-function text(v: unknown, field: string, min = 1, max = 50) {
-  if (typeof v !== 'string' || v.trim().length < min || v.trim().length > max)
-    throw new HttpError(400, `${field} must be ${min}-${max} characters`);
-  return v.trim();
-}
-
-/** Normalizes to UTC ISO strings so SQLite string comparison orders times correctly. */
-function time(v: unknown, field: string) {
-  const d = typeof v === 'string' ? new Date(v) : null;
-  if (!d || isNaN(d.getTime())) throw new HttpError(400, `${field} must be a valid date/time`);
-  return d.toISOString();
-}
 
 const cookie = (req: IncomingMessage, name: 'session' | 'oidc') =>
   req.headers.cookie?.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`))?.[1] ?? '';
@@ -69,30 +29,14 @@ export function oidcConfigFromEnv(env: Record<string, string | undefined>): Oidc
 }
 
 export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
+  const service = createService(db);
   const q = {
-    userByName: db.prepare('SELECT id FROM users WHERE name = ?'),
-    userByOid: db.prepare('SELECT id FROM users WHERE oid = ?'),
     userByToken: db.prepare('SELECT u.id, u.name, u.admin, s.expires_at AS expiresAt FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
-    addOidcUser: db.prepare('INSERT INTO users (name, admin, oid) VALUES (?, ?, ?)'),
-    updateOidcUser: db.prepare('UPDATE users SET name = ?, admin = ? WHERE id = ?'),
     addSession: db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)'),
     delSession: db.prepare('DELETE FROM sessions WHERE token = ?'),
-    rooms: db.prepare('SELECT id, name FROM rooms ORDER BY name'),
-    room: db.prepare('SELECT id FROM rooms WHERE id = ?'),
-    addRoom: db.prepare('INSERT INTO rooms (name) VALUES (?)'),
-    renameRoom: db.prepare('UPDATE rooms SET name = ? WHERE id = ?'),
-    delRoom: db.prepare('DELETE FROM rooms WHERE id = ?'),
-    bookings: db.prepare(`
-      SELECT b.id, b.room_id AS roomId, b.user_id AS userId, u.name AS userName, b.start_at AS start, b.end_at AS end
-      FROM bookings b JOIN users u ON u.id = b.user_id
-      WHERE b.start_at < ? AND b.end_at > ? ORDER BY b.start_at`),
-    clash: db.prepare('SELECT 1 FROM bookings WHERE room_id = ? AND start_at < ? AND end_at > ?'),
-    addBooking: db.prepare('INSERT INTO bookings (room_id, user_id, start_at, end_at) VALUES (?, ?, ?, ?)'),
-    booking: db.prepare('SELECT user_id AS userId FROM bookings WHERE id = ?'),
-    delBooking: db.prepare('DELETE FROM bookings WHERE id = ?'),
   };
 
-  function startSession(user: { id: number; name: string; admin: number }, expiresAt: number) {
+  function startSession(user: { id: number; name: string; admin: boolean }, expiresAt: number) {
     const token = randomBytes(32).toString('base64url');
     q.addSession.run(token, user.id, expiresAt);
     return { token, user: { id: user.id, name: user.name, admin: !!user.admin } };
@@ -119,20 +63,8 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
     const config = await oidcClient();
     const currentUrl = new URL(url.pathname + url.search, oidc.redirectUri);
     const tokens = await client.authorizationCodeGrant(config, currentUrl, { pkceCodeVerifier: verifier, expectedState: state, expectedNonce: nonce, idTokenExpected: true });
-    const claims = tokens.claims()!;
-    if (typeof claims.oid !== 'string' || !claims.oid) throw new Error('ID token has no oid claim');
-    const oid = claims.oid;
-    const claimed = typeof claims.name === 'string' && claims.name.trim() ? claims.name : claims.preferred_username;
-    let name = typeof claimed === 'string' ? claimed.trim().slice(0, 50) : '';
-    if (!name) throw new Error('ID token has no name or preferred_username claim');
-    const admin = Array.isArray(claims.roles) && claims.roles.includes('Admin') ? 1 : 0;
-    const existing = q.userByOid.get(oid) as { id: number } | undefined;
-    const taken = q.userByName.get(name) as { id: number } | undefined;
-    if (taken && taken.id !== existing?.id) name = `${name} (${oid.slice(0, 8)})`;
-    let id = existing?.id;
-    if (id) q.updateOidcUser.run(name, admin, id);
-    else id = Number(q.addOidcUser.run(name, admin, oid).lastInsertRowid);
-    return startSession({ id, name, admin }, Date.now() + OIDC_SESSION_MS);
+    const user = service.upsertOidcUser(tokens.claims()!);
+    return startSession(user, Date.now() + OIDC_SESSION_MS);
   }
 
   async function route(req: IncomingMessage, res: ServerResponse, method: string, path: string, url: URL): Promise<unknown> {
@@ -195,51 +127,34 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
       res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Session expired', reauth: true }));
       return;
     }
-    const requireAdmin = () => { if (!user.admin) throw new HttpError(403, 'Admins only'); };
+    const acting = { id: user.id, name: user.name, admin: !!user.admin };
 
-    if (method === 'GET' && path === '/api/me') return { id: user.id, name: user.name, admin: !!user.admin };
+    if (method === 'GET' && path === '/api/me') return acting;
 
     if (path === '/api/rooms') {
-      if (method === 'GET') return q.rooms.all();
-      if (method === 'POST') {
-        requireAdmin();
-        return { id: Number(q.addRoom.run(text(body.name, 'Room name')).lastInsertRowid) };
-      }
+      if (method === 'GET') return service.listRooms();
+      if (method === 'POST') return service.addRoom(acting, body.name);
     }
     const roomId = Number(path.match(/^\/api\/rooms\/(\d+)$/)?.[1]);
     if (roomId) {
-      requireAdmin();
-      const r = method === 'PATCH' ? q.renameRoom.run(text(body.name, 'Room name'), roomId)
-        : method === 'DELETE' ? q.delRoom.run(roomId) : null;
-      if (r) {
-        if (!r.changes) throw new HttpError(404, 'Room not found');
+      requireAdmin(acting);
+      if (method === 'PATCH') {
+        service.renameRoom(acting, roomId, body.name);
+        return {};
+      }
+      if (method === 'DELETE') {
+        service.deleteRoom(acting, roomId);
         return {};
       }
     }
 
     if (path === '/api/bookings') {
-      if (method === 'GET') {
-        const from = time(url.searchParams.get('from'), 'from');
-        const to = time(url.searchParams.get('to'), 'to');
-        return q.bookings.all(to, from);
-      }
-      if (method === 'POST') {
-        const rid = Number(body.roomId);
-        const start = time(body.start, 'Start');
-        const end = time(body.end, 'End');
-        if (end <= start) throw new HttpError(400, 'End must be after start');
-        if (!Number.isInteger(rid) || !q.room.get(rid)) throw new HttpError(404, 'Room not found');
-        // Check and insert run synchronously with no await between, so no other request can interleave.
-        if (q.clash.get(rid, end, start)) throw new HttpError(409, 'That room is already booked in this time');
-        return { id: Number(q.addBooking.run(rid, user.id, start, end).lastInsertRowid) };
-      }
+      if (method === 'GET') return service.listBookings(url.searchParams.get('from'), url.searchParams.get('to'));
+      if (method === 'POST') return service.bookRoom(acting, body.roomId, body.start, body.end);
     }
     const bookingId = Number(path.match(/^\/api\/bookings\/(\d+)$/)?.[1]);
     if (bookingId && method === 'DELETE') {
-      const b = q.booking.get(bookingId) as { userId: number } | undefined;
-      if (!b) throw new HttpError(404, 'Booking not found');
-      if (b.userId !== user.id && !user.admin) throw new HttpError(403, 'You can only cancel your own bookings');
-      q.delBooking.run(bookingId);
+      service.cancelBooking(acting, bookingId);
       return {};
     }
 
