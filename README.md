@@ -35,6 +35,9 @@ Optional environment variables:
 |------------------|--------------|------------------------------------------------------------------|
 | `DB_PATH`        | `booking.db` | SQLite database file                                             |
 | `PORT`           | `3000`       | HTTP port                                                        |
+| `SEED_ROOM`      | unset        | Room name added at start when there are no rooms (for test environments) |
+| `MCP_ENABLED`    | unset        | `1` turns on the [MCP server](#mcp-server) for clients on this machine |
+| `MCP_SCOPE`      | `api://<OIDC_CLIENT_ID>/Bookings.ReadWrite` | Scope advertised to MCP clients (see [MCP server](#mcp-server)) |
 
 To start over, stop the server and delete `booking.db`.
 
@@ -73,6 +76,51 @@ To try it locally without Entra, run the dev-only mock provider and point the ap
 MOCK_PORT=8090 MOCK_ROLES=Admin node server/mock-oidc.ts
 OIDC_ISSUER=http://localhost:8090 OIDC_CLIENT_ID=mock-client OIDC_CLIENT_SECRET=mock-secret OIDC_REDIRECT_URI=http://localhost:3000/api/callback npm run dev
 ```
+
+## MCP server
+
+The MCP server runs locally only. With `MCP_ENABLED=1`, `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/oauth/authorize` and `/oauth/token` answer requests whose socket address is loopback (`127.0.0.1`, `::1`); otherwise, and for every other address, they return `404`. Leave `MCP_ENABLED` unset in deployments: behind a reverse proxy on the same host, public requests also arrive from loopback.
+
+MCP clients (Claude Code, Claude Desktop, other agents) can use the app at `/mcp` as the signed-in Microsoft user, with exactly that user's permissions in the web UI. The server speaks MCP over Streamable HTTP (JSON responses, no SSE, no sessions): protocol `2026-07-28` statelessly, and `2025-11-25` / `2025-06-18` clients through `initialize`.
+
+Entra ID issues the tokens; this app validates them. Clients find the authorization server through `GET /.well-known/oauth-protected-resource`, which points at this app's own origin. The app runs a small stateless OAuth proxy there, because MCP clients send the RFC 8707 `resource` parameter and Entra v2 rejects it (`AADSTS9010010`):
+
+- `GET /.well-known/oauth-authorization-server`: RFC 8414 metadata (PKCE `S256`, public client, `authorization_code` and `refresh_token`).
+- `GET /oauth/authorize`: requires `client_id` = `OIDC_CLIENT_ID`, a loopback `redirect_uri` (`http://localhost`, `127.0.0.1` or `[::1]`, any port), `response_type=code` and an `S256` code challenge. It adds `offline_access` to the scope so Entra returns a refresh token, drops every other parameter (including `resource`) and redirects to Entra's authorize endpoint.
+- `POST /oauth/token`: form body (100 KB cap), `grant_type` `authorization_code` or `refresh_token`, `client_id` = `OIDC_CLIENT_ID`. It relays only the allow-listed fields to Entra's token endpoint and returns Entra's answer. It never adds the client secret, so the MCP client is a public client. 30 requests per minute per IP; more get `429`.
+
+The proxy keeps no state and logs no codes or tokens. Users still sign in only at Microsoft. A token is accepted only if it is signed by the issuer's keys, `iss` is `OIDC_ISSUER`, `aud` is `OIDC_CLIENT_ID`, `scp` contains `Bookings.ReadWrite`, it has not expired, and it was issued **at most 15 minutes ago**. The 15-minute rule makes clients refresh their token, which re-reads the `Admin` role and fails for disabled users, so the revocation gap stays the same as for web sessions. Each user may make 60 requests per minute; more get `429` with `Retry-After`. After more than 30 failed authentications in a minute, an IP gets `429` for the rest of that minute.
+
+Tools:
+
+| Tool | Who | Arguments | Does |
+|---|---|---|---|
+| `list_rooms` | anyone | – | rooms with id and name |
+| `list_bookings` | anyone | `from`, `to` | bookings overlapping the range, with room and user names |
+| `my_bookings` | anyone | – | your ongoing and upcoming bookings, soonest first |
+| `find_free_rooms` | anyone | `start`, `end` | rooms with no booking in the range |
+| `book_room` | anyone | `roomId`, `start`, `end` | books the room for you; fails on a clash |
+| `cancel_booking` | owner or admin | `bookingId` | cancels the booking |
+| `create_room` | admin | `name` | adds a room |
+| `rename_room` | admin | `roomId`, `name` | renames a room |
+| `delete_room` | admin | `roomId` | deletes a room and its bookings |
+
+Times are ISO 8601 date-times, as in the REST API. Non-admins do not see the admin tools; calling one anyway fails with the same error as the REST API.
+
+One-time Entra setup on the existing app registration (done by a person):
+
+1. **Manifest**: set `requestedAccessTokenVersion` to `2`.
+2. **Expose an API**: set the Application ID URI to `api://<client-id>` and add the delegated scope `Bookings.ReadWrite`.
+3. **Authentication**: add a **Mobile and desktop applications** platform with the MCP client's redirect URI (Claude Code: `http://localhost:<port>/callback`), and allow public client flows: the proxy relays no client secret.
+4. **API permissions**: add the app's own `Bookings.ReadWrite` permission and grant admin consent.
+
+Entra supports neither Dynamic Client Registration nor Client ID Metadata Documents, so clients use the app's pre-registered client id. Claude Code:
+
+```sh
+claude mcp add --transport http booking http://localhost:3000/mcp --client-id <client-id> --callback-port <port>
+```
+
+Check these flags against the current Claude Code docs. If the Application ID URI is not `api://<client-id>`, set `MCP_SCOPE` to the full scope.
 
 ## Tests
 
