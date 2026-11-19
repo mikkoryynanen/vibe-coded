@@ -486,3 +486,95 @@ test('mcp: a valid token creates and updates the user from oid, name and roles',
   assert.deepEqual(userRow('oid-new'), { ...created, admin: 0 }, 'same user, admin removed without the role');
   assert.equal(usersCount(db), users + 1);
 });
+
+const MODERN = '2026-07-28';
+const modernMeta = { 'io.modelcontextprotocol/protocolVersion': MODERN, 'io.modelcontextprotocol/clientCapabilities': {}, 'io.modelcontextprotocol/clientInfo': { name: 'test', version: '1' } };
+/** A 2026-07-28 request: per-request _meta plus the matching MCP-Protocol-Version, Mcp-Method and Mcp-Name headers. */
+function modernRequest(method: string, params: Claims = {}, id: number | null = 1) {
+  const headers: Record<string, string> = { 'MCP-Protocol-Version': MODERN, 'Mcp-Method': method };
+  if (typeof params.name === 'string') headers['Mcp-Name'] = params.name;
+  return { body: { jsonrpc: '2.0', ...(id !== null && { id }), method, params: { ...params, _meta: modernMeta } }, headers };
+}
+const LEGACY_HEADERS = { 'MCP-Protocol-Version': '2025-11-25' };
+
+test('mcp: protocol versions, lifecycle and JSON-RPC errors', async (t) => {
+  const { origin, post, token } = await startMcp(t);
+  const tok = await token();
+  const rpc = async (body: unknown, headers: Record<string, string> = {}) => {
+    const res = await post(tok, body, headers);
+    const text = await res.text();
+    return { status: res.status, data: text ? JSON.parse(text) : undefined, contentType: res.headers.get('content-type') };
+  };
+
+  const init = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1' } } });
+  assert.equal(init.status, 200);
+  assert.equal(init.contentType, 'application/json');
+  assert.deepEqual(init.data, { jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'desk-booking', version: '1.0.0' } } });
+  const old = await rpc({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } });
+  assert.equal(old.data.result.protocolVersion, '2025-06-18');
+  const unknownInit = await rpc({ jsonrpc: '2.0', id: 3, method: 'initialize', params: { protocolVersion: '1900-01-01', capabilities: {} } });
+  assert.equal(unknownInit.data.result.protocolVersion, '2025-11-25', 'legacy negotiation answers with a supported version');
+  const initialized = await rpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, LEGACY_HEADERS);
+  assert.deepEqual([initialized.status, initialized.data], [202, undefined]);
+
+  const legacyList = await rpc({ jsonrpc: '2.0', id: 4, method: 'tools/list' }, LEGACY_HEADERS);
+  assert.equal(legacyList.status, 200);
+  assert.ok(Array.isArray(legacyList.data.result.tools));
+  assert.equal(legacyList.data.result._meta, undefined);
+  assert.deepEqual((await rpc({ jsonrpc: '2.0', id: 'p', method: 'ping' }, { 'MCP-Protocol-Version': '2025-06-18' })).data, { jsonrpc: '2.0', id: 'p', result: {} });
+
+  const ping = modernRequest('ping');
+  assert.deepEqual(await rpc(ping.body, ping.headers), {
+    status: 200, contentType: 'application/json',
+    data: { jsonrpc: '2.0', id: 1, result: { _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'desk-booking', version: '1.0.0' } } } },
+  });
+  const list = modernRequest('tools/list');
+  assert.equal((await rpc(list.body, list.headers)).status, 200, 'stateless: no initialize needed');
+  const note = modernRequest('notifications/cancelled', { requestId: 1 }, null);
+  assert.equal((await rpc(note.body, note.headers)).status, 202);
+
+  const headerMismatch = async (headers: Record<string, string | undefined>, body: unknown = ping.body) => {
+    const r = await rpc(body, Object.fromEntries(Object.entries(headers).filter(([, v]) => v !== undefined)) as Record<string, string>);
+    assert.equal(r.status, 400, JSON.stringify(headers));
+    assert.equal(r.data.error.code, -32020, JSON.stringify(headers));
+    return r.data.error.message as string;
+  };
+  assert.equal(await headerMismatch({ ...ping.headers, 'Mcp-Method': 'tools/list' }), "Header mismatch: Mcp-Method header value 'tools/list' does not match body value 'ping'");
+  await headerMismatch({ ...ping.headers, 'Mcp-Method': undefined });
+  await headerMismatch({ ...ping.headers, 'MCP-Protocol-Version': undefined });
+  await headerMismatch({ 'Mcp-Method': 'ping', 'MCP-Protocol-Version': '2025-11-25' });
+  const call = modernRequest('tools/call', { name: 'list_rooms', arguments: {} });
+  await headerMismatch({ ...call.headers, 'Mcp-Name': 'delete_room' }, call.body);
+  await headerMismatch({ ...call.headers, 'Mcp-Name': undefined }, call.body);
+  await headerMismatch({}, { jsonrpc: '2.0', id: 9, method: 'tools/list' });
+
+  const unsupported = await rpc({ ...ping.body, params: { _meta: { ...modernMeta, 'io.modelcontextprotocol/protocolVersion': '1900-01-01' } } }, { ...ping.headers, 'MCP-Protocol-Version': '1900-01-01' });
+  assert.deepEqual([unsupported.status, unsupported.data], [400, { jsonrpc: '2.0', id: 1, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: ['2026-07-28', '2025-11-25', '2025-06-18'], requested: '1900-01-01' } } }]);
+  const unsupportedLegacy = await rpc({ jsonrpc: '2.0', id: 5, method: 'tools/list' }, { 'MCP-Protocol-Version': '2024-11-05' });
+  assert.deepEqual([unsupportedLegacy.status, unsupportedLegacy.data.error.code, unsupportedLegacy.data.error.data.requested], [400, -32022, '2024-11-05']);
+  const noCaps = await rpc({ ...ping.body, params: { _meta: { 'io.modelcontextprotocol/protocolVersion': MODERN } } }, ping.headers);
+  assert.deepEqual([noCaps.status, noCaps.data.error.code], [400, -32602]);
+
+  const unknown = modernRequest('resources/list');
+  assert.deepEqual(await rpc(unknown.body, unknown.headers), { status: 404, contentType: 'application/json', data: { jsonrpc: '2.0', id: 1, error: { code: -32601, message: 'Method not found' } } });
+  const unknownLegacy = await rpc({ jsonrpc: '2.0', id: 6, method: 'prompts/list' }, LEGACY_HEADERS);
+  assert.deepEqual([unknownLegacy.status, unknownLegacy.data.error.code], [200, -32601], 'legacy clients read a 404 as a lost session');
+
+  const parse = await rpc('{"jsonrpc": "2.0", "id": 1, "method": ', LEGACY_HEADERS);
+  assert.deepEqual([parse.status, parse.data], [400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }]);
+  for (const bad of [[{ jsonrpc: '2.0', id: 1, method: 'ping' }], { id: 1, method: 'ping' }, { jsonrpc: '2.0', id: null, method: 'ping' }, { jsonrpc: '2.0', id: 1, result: {} }]) {
+    const r = await rpc(bad, LEGACY_HEADERS);
+    assert.deepEqual([r.status, r.data.error.code], [400, -32600], JSON.stringify(bad));
+  }
+
+  for (const method of ['GET', 'DELETE', 'PUT']) {
+    const res = await fetch(`${origin}/mcp`, { method, headers: { Authorization: `Bearer ${tok}` } });
+    assert.equal(res.status, 405, method);
+    assert.equal(res.headers.get('allow'), 'POST');
+  }
+  assert.equal((await fetch(`${origin}/mcp`)).status, 405, 'GET without a token');
+
+  const big = await post(tok, { jsonrpc: '2.0', id: 7, method: 'ping', params: { pad: 'x'.repeat(110_000) } }, LEGACY_HEADERS);
+  assert.equal(big.status, 413);
+  assert.equal((await big.json()).error.code, -32600);
+});
