@@ -27,3 +27,7 @@ export function openDb(path: string) {
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS users_oid ON users (oid)');
   return db;
 }
+
+export function ensureRoom(db: DatabaseSync, name: string) {
+  db.prepare('INSERT INTO rooms (name) SELECT ? WHERE NOT EXISTS (SELECT 1 FROM rooms)').run(name);
+}

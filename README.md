@@ -35,6 +35,7 @@ Optional environment variables:
 |------------------|--------------|------------------------------------------------------------------|
 | `DB_PATH`        | `booking.db` | SQLite database file                                             |
 | `PORT`           | `3000`       | HTTP port                                                        |
+| `SEED_ROOM`      | unset        | Room name added at start when there are no rooms (for test environments) |
 | `MCP_ENABLED`    | unset        | `1` turns on the [MCP server](#mcp-server) for clients on this machine |
 | `MCP_SCOPE`      | `api://<OIDC_CLIENT_ID>/Bookings.ReadWrite` | Scope advertised to MCP clients (see [MCP server](#mcp-server)) |
 

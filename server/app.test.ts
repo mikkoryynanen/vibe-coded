@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes } from 'node:crypto';
 import { OAuth2Issuer, OAuth2Server } from 'oauth2-mock-server';
-import { openDb } from './db.ts';
+import { ensureRoom, openDb } from './db.ts';
 import { createHandler, oidcConfigFromEnv } from './app.ts';
 
 const usersCount = (db: DatabaseSync) => Number(db.prepare('SELECT COUNT(*) AS n FROM users').get()?.n);
@@ -968,4 +968,16 @@ test('mcp: its routes are 404 unless enabled and called from loopback', async (t
     assert.equal(res.status, 404, `${method} ${path} from ${lan.address}`);
   }
   assert.equal(usersCount(on.db), 0, 'a valid token from a non-loopback address creates no user');
+});
+
+test('ensureRoom adds the room only when there are no rooms', () => {
+  const db = openDb(':memory:');
+  const names = () => db.prepare('SELECT name FROM rooms ORDER BY id').all().map((r) => r.name);
+  ensureRoom(db, 'Test room');
+  ensureRoom(db, 'Test room');
+  assert.deepEqual(names(), ['Test room']);
+  db.prepare('DELETE FROM rooms').run();
+  db.prepare('INSERT INTO rooms (name) VALUES (?)').run('Desk 1');
+  ensureRoom(db, 'Test room');
+  assert.deepEqual(names(), ['Desk 1']);
 });

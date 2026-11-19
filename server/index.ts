@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { createServer as createVite } from 'vite';
-import { openDb } from './db.ts';
+import { ensureRoom, openDb } from './db.ts';
 import { createHandler, oidcConfigFromEnv } from './app.ts';
 
 // Microsoft sign-in is the only way in, so the app refuses to start without its config.
@@ -13,6 +13,8 @@ const oidc = (() => {
   }
 })();
 const db = openDb(process.env.DB_PATH ?? 'booking.db');
+const seedRoom = process.env.SEED_ROOM?.trim();
+if (seedRoom) ensureRoom(db, seedRoom.slice(0, 50));
 const api = createHandler(db, oidc, { mcpScope: process.env.MCP_SCOPE?.trim() || undefined, mcpEnabled: process.env.MCP_ENABLED === '1' });
 const port = Number(process.env.PORT ?? 3000);
 
