@@ -13,10 +13,11 @@ const oidc = (() => {
   }
 })();
 const db = openDb(process.env.DB_PATH ?? 'booking.db');
-const api = createHandler(db, oidc);
+const api = createHandler(db, oidc, { mcpScope: process.env.MCP_SCOPE?.trim() || undefined });
 const port = Number(process.env.PORT ?? 3000);
 
-// One server: /api goes to the API, everything else to Vite (UI with hot reload).
-const server = createServer((req, res) => (req.url?.startsWith('/api') ? api(req, res) : vite.middlewares(req, res)));
+// One server: /api, /mcp and its OAuth metadata go to the API, everything else to Vite (UI with hot reload).
+const toApi = (url = '') => url.startsWith('/api') || /^\/(mcp|\.well-known\/oauth-protected-resource)(\?|$)/.test(url);
+const server = createServer((req, res) => (toApi(req.url) ? api(req, res) : vite.middlewares(req, res)));
 const vite = await createVite({ server: { middlewareMode: true, hmr: { server } }, appType: 'spa' });
 server.listen(port, () => console.log(`App on http://localhost:${port}`));

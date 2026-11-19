@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomBytes } from 'node:crypto';
 import * as client from 'openid-client';
+import { createMcp } from './mcp.ts';
 import { createService, HttpError, readJson, requireAdmin } from './service.ts';
 
 type User = { id: number; name: string; admin: number };
@@ -28,7 +29,7 @@ export function oidcConfigFromEnv(env: Record<string, string | undefined>): Oidc
   return { issuer: env.OIDC_ISSUER!, clientId: env.OIDC_CLIENT_ID!, clientSecret: env.OIDC_CLIENT_SECRET!, redirectUri: env.OIDC_REDIRECT_URI! };
 }
 
-export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
+export function createHandler(db: DatabaseSync, oidc: OidcConfig, opts: { mcpScope?: string } = {}) {
   const service = createService(db);
   const q = {
     userByToken: db.prepare('SELECT u.id, u.name, u.admin, s.expires_at AS expiresAt FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
@@ -57,6 +58,8 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
     return discovered;
   };
 
+  const mcp = createMcp(service, { ...oidc, scope: opts.mcpScope, jwksUri: async () => (await oidcClient()).serverMetadata().jwks_uri });
+
   async function signIn(url: URL, flow: string) {
     const [verifier, state, nonce] = flow.split('.');
     if (!verifier || !state || !nonce) throw new Error('OIDC flow cookie missing or expired');
@@ -68,6 +71,10 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig) {
   }
 
   async function route(req: IncomingMessage, res: ServerResponse, method: string, path: string, url: URL): Promise<unknown> {
+    // MCP uses bearer tokens only (never the session cookie) and authenticates before reading the body.
+    if (path === '/mcp') return mcp.handle(req, res, method);
+    if (method === 'GET' && path === '/.well-known/oauth-protected-resource') return mcp.metadata();
+
     const body = method === 'POST' || method === 'PATCH' ? await readJson(req) : {};
 
     if (method === 'GET' && path === '/api/login') {

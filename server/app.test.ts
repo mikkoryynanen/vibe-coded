@@ -16,7 +16,7 @@ const cookieValue = (res: Response, name: string) => setCookie(res, name)?.match
 
 type Tamper = (cb: URL, flow: string) => string | null | Promise<string | null>;
 
-async function startOidc(t: TestContext) {
+async function startOidc(t: TestContext, opts: { mcpScope?: string } = {}) {
   const mock = new OAuth2Server();
   await mock.issuer.keys.generate('RS256');
   await mock.start(0, 'localhost');
@@ -28,7 +28,7 @@ async function startOidc(t: TestContext) {
   const server = createServer().listen(0);
   t.after(() => server.close());
   const origin = `http://localhost:${(server.address() as AddressInfo).port}`;
-  server.on('request', createHandler(db, { issuer: mock.issuer.url!, clientId: 'test-client', clientSecret: 'test-secret', redirectUri: `${origin}/api/callback` }));
+  server.on('request', createHandler(db, { issuer: mock.issuer.url!, clientId: 'test-client', clientSecret: 'test-secret', redirectUri: `${origin}/api/callback` }, opts));
   const base = `${origin}/api`;
 
   /** Runs login -> mock authorize -> callback. `tamper` may change the callback URL and returns the flow cookie to send. */
@@ -48,7 +48,7 @@ async function startOidc(t: TestContext) {
     const res = await fetch(base + path, { method, headers: { 'Content-Type': 'application/json', ...(token && { Cookie: `session=${token}` }) }, body: body && JSON.stringify(body) });
     return { status: res.status, data: await res.json(), res };
   };
-  return { mock, db, base, signIn, call };
+  return { mock, db, origin, base, signIn, call };
 }
 
 /** A session row inserted directly, as Microsoft sign-in would leave it. */
@@ -359,4 +359,130 @@ test('openDb upgrades an old-schema database in place', (t) => {
 test('a fresh database has no pass column', () => {
   const db = openDb(':memory:');
   assert.deepEqual((db.prepare("SELECT name FROM pragma_table_info('users')").all() as { name: string }[]).map((c) => c.name), ['id', 'name', 'admin', 'oid']);
+});
+
+type Claims = Record<string, unknown>;
+const nowS = () => Math.floor(Date.now() / 1000);
+
+/** An Entra-style v2 access token for /mcp; claims set to undefined are removed. */
+function accessToken(issuer: OAuth2Issuer, claims: Claims = {}, kid?: string) {
+  return issuer.buildToken({
+    kid,
+    scopesOrTransform: (_h, p) => {
+      Object.assign(p, { aud: 'test-client', scp: 'Bookings.ReadWrite', oid: 'oid-mcp', name: 'Mcp User', ...claims });
+      for (const k of Object.keys(p)) if (p[k] === undefined) delete p[k];
+    },
+  });
+}
+
+async function startMcp(t: TestContext, opts: { mcpScope?: string } = {}) {
+  const ctx = await startOidc(t, opts);
+  const post = (token: string | undefined, body: unknown, headers: Record<string, string> = {}) =>
+    fetch(`${ctx.origin}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...(token && { Authorization: `Bearer ${token}` }), ...headers },
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    });
+  const userRow = (oid: string) => {
+    const row = ctx.db.prepare('SELECT id, name, admin FROM users WHERE oid = ?').get(oid);
+    return row && { ...row };
+  };
+  return { ...ctx, post, userRow, token: (claims?: Claims, kid?: string) => accessToken(ctx.mock.issuer, claims, kid) };
+}
+
+test('mcp: missing or invalid bearer tokens get 401 with the resource metadata challenge', async (t) => {
+  const { mock, db, origin, base, signIn, post, token } = await startMcp(t);
+  const challenge = `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource", scope="api://test-client/Bookings.ReadWrite"`;
+  const ping = { jsonrpc: '2.0', id: 1, method: 'ping' };
+
+  const none = await post(undefined, ping);
+  assert.equal(none.status, 401);
+  assert.equal(none.headers.get('www-authenticate'), challenge);
+  assert.deepEqual(await none.json(), { error: 'Unauthorized' });
+
+  const forger = new OAuth2Issuer();
+  forger.url = mock.issuer.url;
+  await forger.keys.generate('RS256', { kid: mock.issuer.keys.get()?.kid });
+  const session = (await signIn({ oid: 'oid-web', name: 'Web' })).token;
+  const users = usersCount(db);
+  const cases: [string, () => Promise<Response>][] = [
+    ['other signing key', async () => post(await accessToken(forger), ping)],
+    ['wrong iss', async () => post(await token({ iss: 'https://evil.example/' }), ping)],
+    ['wrong aud', async () => post(await token({ aud: 'another-client' }), ping)],
+    ['missing scp', async () => post(await token({ scp: undefined }), ping)],
+    ['other scope only', async () => post(await token({ scp: 'User.Read' }), ping)],
+    ['expired exp', async () => post(await token({ iat: nowS() - 600, nbf: nowS() - 600, exp: nowS() - 61 }), ping)],
+    ['nbf in the future', async () => post(await token({ nbf: nowS() + 120 }), ping)],
+    ['iat older than 15 minutes', async () => post(await token({ iat: nowS() - 16 * 60 }), ping)],
+    ['missing iat', async () => post(await token({ iat: undefined }), ping)],
+    ['missing oid', async () => post(await token({ oid: undefined }), ping)],
+    ['malformed token', () => post('not-a-jwt', ping)],
+    ['malformed segments', () => post('a.b.c', ping)],
+    ['alg none', async () => {
+      const [, payload] = (await token()).split('.');
+      const header = Buffer.from(JSON.stringify({ alg: 'none', kid: mock.issuer.keys.get()?.kid })).toString('base64url');
+      return post(`${header}.${payload}.`, ping);
+    }],
+    ['basic auth', () => post(undefined, ping, { Authorization: 'Basic dXNlcjpwYXNz' })],
+    ['session cookie instead of bearer', () => post(undefined, ping, { Cookie: `session=${session}` })],
+  ];
+  for (const [name, run] of cases) {
+    const res = await run();
+    assert.equal(res.status, 401, name);
+    assert.equal(res.headers.get('www-authenticate'), challenge, name);
+    assert.deepEqual(await res.json(), { error: 'Unauthorized' }, name);
+  }
+  assert.equal(usersCount(db), users, 'no user created by rejected tokens');
+
+  const ok = await post(await token({ iat: nowS() - 14 * 60, exp: nowS() - 30 }), ping, { 'MCP-Protocol-Version': '2025-11-25' });
+  assert.notEqual(ok.status, 401, 'within the 60 s skew and 15 minute age');
+
+  const valid = await token();
+  for (const path of ['/me', '/bookings?from=2030-01-01T00:00Z&to=2030-01-02T00:00Z', '/rooms']) {
+    const res = await fetch(base + path, { headers: { Authorization: `Bearer ${valid}` } });
+    assert.equal(res.status, 401, `REST ${path} ignores bearer tokens`);
+    assert.deepEqual(await res.json(), { error: 'Not logged in' });
+  }
+});
+
+test('mcp: signing keys are cached and refetched at most once a minute', async (t) => {
+  const { mock, post, token } = await startMcp(t);
+  const ping = { jsonrpc: '2.0', id: 1, method: 'ping' };
+  const headers = { 'MCP-Protocol-Version': '2025-11-25' };
+  assert.notEqual((await post(await token(), ping, headers)).status, 401);
+  await mock.issuer.keys.generate('RS256', { kid: 'rotated' });
+  assert.equal((await post(await token({}, 'rotated'), ping, headers)).status, 401, 'unknown kid within a minute of the last fetch');
+});
+
+test('mcp: protected resource metadata is public', async (t) => {
+  const { mock, origin } = await startMcp(t);
+  const res = await fetch(`${origin}/.well-known/oauth-protected-resource`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    resource: `${origin}/mcp`,
+    authorization_servers: [mock.issuer.url],
+    scopes_supported: ['api://test-client/Bookings.ReadWrite'],
+    bearer_methods_supported: ['header'],
+  });
+  assert.equal((await fetch(`${origin}/.well-known/oauth-protected-resource`, { method: 'POST' })).status, 401, 'only GET is public');
+
+  const custom = await startMcp(t, { mcpScope: 'api://custom-app/Bookings.ReadWrite' });
+  const meta = await (await fetch(`${custom.origin}/.well-known/oauth-protected-resource`)).json();
+  assert.deepEqual(meta.scopes_supported, ['api://custom-app/Bookings.ReadWrite']);
+  const challenge = (await custom.post(undefined, {})).headers.get('www-authenticate');
+  assert.equal(challenge, `Bearer resource_metadata="${custom.origin}/.well-known/oauth-protected-resource", scope="api://custom-app/Bookings.ReadWrite"`);
+});
+
+test('mcp: a valid token creates and updates the user from oid, name and roles', async (t) => {
+  const { db, post, token, userRow } = await startMcp(t);
+  const ping = { jsonrpc: '2.0', id: 1, method: 'ping' };
+  const headers = { 'MCP-Protocol-Version': '2025-11-25' };
+  const users = usersCount(db);
+  assert.notEqual((await post(await token({ oid: 'oid-new', name: 'New User', roles: ['Admin'] }), ping, headers)).status, 401);
+  const created = userRow('oid-new');
+  assert.deepEqual({ name: created?.name, admin: created?.admin }, { name: 'New User', admin: 1 });
+  assert.equal(usersCount(db), users + 1);
+  await post(await token({ oid: 'oid-new', name: 'New User' }), ping, headers);
+  assert.deepEqual(userRow('oid-new'), { ...created, admin: 0 }, 'same user, admin removed without the role');
+  assert.equal(usersCount(db), users + 1);
 });
