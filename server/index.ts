@@ -13,7 +13,7 @@ const oidc = (() => {
   }
 })();
 const db = openDb(process.env.DB_PATH ?? 'booking.db');
-const api = createHandler(db, oidc, { mcpScope: process.env.MCP_SCOPE?.trim() || undefined });
+const api = createHandler(db, oidc, { mcpScope: process.env.MCP_SCOPE?.trim() || undefined, mcpEnabled: process.env.MCP_ENABLED === '1' });
 const port = Number(process.env.PORT ?? 3000);
 
 // One server: /api, /mcp, its OAuth metadata and the OAuth proxy go to the API, everything else to Vite (UI with hot reload).

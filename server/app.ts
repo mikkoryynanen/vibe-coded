@@ -23,6 +23,9 @@ const logOidcFailure = (step: string, e: unknown) => {
 // OIDC sessions end after this, so the next silent sign-in re-reads the Entra roles.
 const OIDC_SESSION_MS = 15 * 60 * 1000;
 
+const MCP_PATH = /^\/(mcp|oauth\/(authorize|token)|\.well-known\/oauth-(protected-resource|authorization-server))$/;
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
 /** Reads the four required OIDC_* vars; throws naming the missing ones (never their values). */
 export function oidcConfigFromEnv(env: Record<string, string | undefined>): OidcConfig {
   const missing = ['OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_REDIRECT_URI'].filter((k) => !env[k]?.trim());
@@ -30,7 +33,7 @@ export function oidcConfigFromEnv(env: Record<string, string | undefined>): Oidc
   return { issuer: env.OIDC_ISSUER!, clientId: env.OIDC_CLIENT_ID!, clientSecret: env.OIDC_CLIENT_SECRET!, redirectUri: env.OIDC_REDIRECT_URI! };
 }
 
-export function createHandler(db: DatabaseSync, oidc: OidcConfig, opts: { mcpScope?: string } = {}) {
+export function createHandler(db: DatabaseSync, oidc: OidcConfig, opts: { mcpScope?: string; mcpEnabled?: boolean } = {}) {
   const service = createService(db);
   const q = {
     userByToken: db.prepare('SELECT u.id, u.name, u.admin, s.expires_at AS expiresAt FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?'),
@@ -81,6 +84,8 @@ export function createHandler(db: DatabaseSync, oidc: OidcConfig, opts: { mcpSco
   }
 
   async function route(req: IncomingMessage, res: ServerResponse, method: string, path: string, url: URL): Promise<unknown> {
+    // MCP and its OAuth routes exist only when enabled, and only for clients on this machine.
+    if (MCP_PATH.test(path) && !(opts.mcpEnabled && LOOPBACK.has(req.socket.remoteAddress ?? ''))) throw new HttpError(404, 'Not found');
     // MCP uses bearer tokens only (never the session cookie) and authenticates before reading the body.
     if (path === '/mcp') return mcp.handle(req, res, method);
     if (method === 'GET' && path === '/.well-known/oauth-protected-resource') return mcp.metadata();

@@ -35,6 +35,7 @@ Optional environment variables:
 |------------------|--------------|------------------------------------------------------------------|
 | `DB_PATH`        | `booking.db` | SQLite database file                                             |
 | `PORT`           | `3000`       | HTTP port                                                        |
+| `MCP_ENABLED`    | unset        | `1` turns on the [MCP server](#mcp-server) for clients on this machine |
 | `MCP_SCOPE`      | `api://<OIDC_CLIENT_ID>/Bookings.ReadWrite` | Scope advertised to MCP clients (see [MCP server](#mcp-server)) |
 
 To start over, stop the server and delete `booking.db`.
@@ -77,6 +78,8 @@ OIDC_ISSUER=http://localhost:8090 OIDC_CLIENT_ID=mock-client OIDC_CLIENT_SECRET=
 
 ## MCP server
 
+The MCP server runs locally only. With `MCP_ENABLED=1`, `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/oauth/authorize` and `/oauth/token` answer requests whose socket address is loopback (`127.0.0.1`, `::1`); otherwise, and for every other address, they return `404`. Leave `MCP_ENABLED` unset in deployments: behind a reverse proxy on the same host, public requests also arrive from loopback.
+
 MCP clients (Claude Code, Claude Desktop, other agents) can use the app at `/mcp` as the signed-in Microsoft user, with exactly that user's permissions in the web UI. The server speaks MCP over Streamable HTTP (JSON responses, no SSE, no sessions): protocol `2026-07-28` statelessly, and `2025-11-25` / `2025-06-18` clients through `initialize`.
 
 Entra ID issues the tokens; this app validates them. Clients find the authorization server through `GET /.well-known/oauth-protected-resource`, which points at this app's own origin. The app runs a small stateless OAuth proxy there, because MCP clients send the RFC 8707 `resource` parameter and Entra v2 rejects it (`AADSTS9010010`):
@@ -113,7 +116,7 @@ One-time Entra setup on the existing app registration (done by a person):
 Entra supports neither Dynamic Client Registration nor Client ID Metadata Documents, so clients use the app's pre-registered client id. Claude Code:
 
 ```sh
-claude mcp add --transport http booking https://<host>/mcp --client-id <client-id> --callback-port <port>
+claude mcp add --transport http booking http://localhost:3000/mcp --client-id <client-id> --callback-port <port>
 ```
 
 Check these flags against the current Claude Code docs. If the Application ID URI is not `api://<client-id>`, set `MCP_SCOPE` to the full scope.
