@@ -20,7 +20,20 @@ export function openDb(path: string) {
   `);
   // Existing databases predate these columns; CREATE TABLE IF NOT EXISTS does not add them.
   const hasColumn = (table: string, column: string) => !!db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column);
-  if (!hasColumn('users', 'oid')) db.exec('ALTER TABLE users ADD COLUMN oid TEXT');
+  if (!hasColumn('users', 'oid')) {
+    db.exec(`
+      PRAGMA foreign_keys = OFF;
+      BEGIN;
+      CREATE TABLE users_new (
+        id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL COLLATE NOCASE,
+        admin INTEGER NOT NULL DEFAULT 0, oid TEXT);
+      INSERT INTO users_new (id, name, admin) SELECT id, name, admin FROM users;
+      DROP TABLE users;
+      ALTER TABLE users_new RENAME TO users;
+      COMMIT;
+      PRAGMA foreign_keys = ON;
+    `);
+  }
   if (!hasColumn('sessions', 'expires_at')) db.exec('ALTER TABLE sessions ADD COLUMN expires_at INTEGER');
   // Password login is gone; dropping the column deletes the old password hashes.
   if (hasColumn('users', 'pass')) db.exec('ALTER TABLE users DROP COLUMN pass');
