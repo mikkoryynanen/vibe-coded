@@ -51,7 +51,7 @@ export type Service = ReturnType<typeof createService>;
 export function createService(db: DatabaseSync) {
   const q = {
     userByName: db.prepare('SELECT id FROM users WHERE name = ?'),
-    userByOid: db.prepare('SELECT id FROM users WHERE oid = ?'),
+    userByOid: db.prepare('SELECT id, admin FROM users WHERE oid = ?'),
     addOidcUser: db.prepare('INSERT INTO users (name, admin, oid) VALUES (?, ?, ?)'),
     updateOidcUser: db.prepare('UPDATE users SET name = ?, admin = ? WHERE id = ?'),
     rooms: db.prepare('SELECT id, name FROM rooms ORDER BY name'),
@@ -85,19 +85,19 @@ export function createService(db: DatabaseSync) {
   };
 
   return {
-    /** Creates or updates the user for verified Entra claims (ID token or access token). */
-    upsertOidcUser(claims: Record<string, unknown>): ActingUser {
+    /** Creates or updates the user for verified Entra claims. With `lowerAdminOnly` (bearer tokens) a stored admin flag is never raised. */
+    upsertOidcUser(claims: Record<string, unknown>, opts: { lowerAdminOnly?: boolean } = {}): ActingUser {
       if (typeof claims.oid !== 'string' || !claims.oid) throw new Error('Token has no oid claim');
       const oid = claims.oid;
       const claimed = typeof claims.name === 'string' && claims.name.trim() ? claims.name : claims.preferred_username;
       let name = typeof claimed === 'string' ? claimed.trim().slice(0, 50) : '';
       if (!name) throw new Error('Token has no name or preferred_username claim');
       const admin = Array.isArray(claims.roles) && claims.roles.includes('Admin');
-      const existing = q.userByOid.get(oid) as { id: number } | undefined;
+      const existing = q.userByOid.get(oid) as { id: number; admin: number } | undefined;
       const taken = q.userByName.get(name) as { id: number } | undefined;
       if (taken && taken.id !== existing?.id) name = `${name} (${oid.slice(0, 8)})`;
       let id = existing?.id;
-      if (id) q.updateOidcUser.run(name, admin ? 1 : 0, id);
+      if (id) q.updateOidcUser.run(name, admin && !(opts.lowerAdminOnly && !existing?.admin) ? 1 : 0, id);
       else id = Number(q.addOidcUser.run(name, admin ? 1 : 0, oid).lastInsertRowid);
       return { id, name, admin };
     },

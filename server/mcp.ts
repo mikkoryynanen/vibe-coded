@@ -117,7 +117,7 @@ export function createMcp(service: Service, cfg: McpConfig) {
     const token = req.headers.authorization?.match(/^Bearer +(\S+)$/i)?.[1];
     try {
       if (!token) throw new Error('No bearer token');
-      return service.upsertOidcUser(await verifyToken(token));
+      return service.upsertOidcUser(await verifyToken(token), { lowerAdminOnly: true });
     } catch (e) {
       console.error('MCP auth failed:', e instanceof Error ? e.message : 'unknown error');
     }

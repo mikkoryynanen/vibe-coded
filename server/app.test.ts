@@ -487,6 +487,21 @@ test('mcp: a valid token creates and updates the user from oid, name and roles',
   assert.equal(usersCount(db), users + 1);
 });
 
+test('mcp: an older Admin token does not raise the stored admin flag after a web sign-in without the role', async (t) => {
+  const { post, token, signIn, call, userRow } = await startMcp(t);
+  const ping = { jsonrpc: '2.0', id: 1, method: 'ping' };
+  const headers = { 'MCP-Protocol-Version': '2025-11-25' };
+  const stale = await token({ oid: 'oid-demoted', name: 'Demoted', roles: ['Admin'] });
+  const session = (await signIn({ oid: 'oid-demoted', name: 'Demoted' })).token;
+  assert.equal((await call('GET', '/me', session)).data.admin, false);
+  assert.equal((await post(stale, ping, headers)).status, 200);
+  assert.equal((await call('GET', '/me', session)).data.admin, false, 'web session stays non-admin');
+  assert.equal(userRow('oid-demoted')?.admin, 0);
+  assert.equal((await call('POST', '/rooms', session, { name: 'Sneaky' })).status, 403);
+  const tools = await (await post(stale, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, headers)).json();
+  assert.ok(tools.result.tools.some((x: { name: string }) => x.name === 'create_room'), 'the MCP call itself still uses the token roles');
+});
+
 const MODERN = '2026-07-28';
 const modernMeta = { 'io.modelcontextprotocol/protocolVersion': MODERN, 'io.modelcontextprotocol/clientCapabilities': {}, 'io.modelcontextprotocol/clientInfo': { name: 'test', version: '1' } };
 /** A 2026-07-28 request: per-request _meta plus the matching MCP-Protocol-Version, Mcp-Method and Mcp-Name headers. */
